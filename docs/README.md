@@ -20,7 +20,7 @@ Add these lines to your `.bashrc` or equivalent to ensure you have permissions t
 export GEM_HOME="$HOME/gems"
 export PATH="$HOME/gems/bin:$PATH"
 ```
-Don't forget to `source ~/.bashrc` afterwards 😊.
+Don't forget to `source ~/.bashrc` afterward 😊.
 
 
 Now we can install Jekyll and [Bundler](https://bundler.io/):
@@ -35,12 +35,22 @@ We now need to install the required Ruby packages for the website.
 
 > Could not locate Gemfile
 
-**NOTE**: this step frequently hangs when connected to a VPN (including MSVPN). Simply disconnect for the package installation.
+**NOTE**: This step frequently hangs when connected to a VPN (including MSVPN). Simply disconnect for the package installation.
 
 
 ```
 bundle install
 ```
+
+Depending on your environment, you may need to add `webrick` to avoid the following [error](https://talk.jekyllrb.com/t/load-error-cannot-load-such-file-webrick/5417/6):
+
+> gems/gems/jekyll-3.9.5/lib/jekyll/commands/serve/servlet.rb:3:in `require': cannot load such file -- webrick (LoadError)
+
+
+```
+bundle add webrick
+```
+
 
 You can now start a local webserver via:
 ```

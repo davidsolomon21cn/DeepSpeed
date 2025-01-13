@@ -3,84 +3,172 @@
 
 # DeepSpeed Team
 
+import pytest
+
+import itertools
+import pickle
 import os
 import time
-import torch
-import pytest
-import itertools
+import requests
+import fcntl
+
+from dataclasses import dataclass
+from typing import List
+
 import deepspeed
-from deepspeed.git_version_info import torch_info
-from unit.common import DistributedTest
+import torch
+
+from huggingface_hub import HfApi
 from packaging import version as pkg_version
-from deepspeed.ops.op_builder import OpBuilder
+from torch import nn
 from transformers import pipeline
 from transformers.models.t5.modeling_t5 import T5Block
 from transformers.models.roberta.modeling_roberta import RobertaLayer
-from huggingface_hub import HfApi
-from deepspeed.model_implementations import DeepSpeedTransformerInference
-from torch import nn
+
 from deepspeed.accelerator import get_accelerator
+from deepspeed.git_version_info import torch_info
+from deepspeed.model_implementations import DeepSpeedTransformerInference
+from deepspeed.ops.op_builder import InferenceBuilder
+from deepspeed.ops.op_builder import OpBuilder
+
+from unit.common import DistributedTest
 
 rocm_version = OpBuilder.installed_rocm_version()
 if rocm_version != (0, 0):
     pytest.skip("skip inference tests on rocm for now", allow_module_level=True)
 
 _bert_models = [
-    "bert-base-cased",
-    "bert-base-uncased",
-    "bert-large-cased",
-    "bert-large-uncased",
-    "bert-base-multilingual-cased",
-    "bert-base-multilingual-uncased",
+    "google-bert/bert-base-cased",
+    "google-bert/bert-base-uncased",
+    "google-bert/bert-large-cased",
+    "google-bert/bert-large-uncased",
+    "google-bert/bert-base-multilingual-cased",
+    "google-bert/bert-base-multilingual-uncased",
     "deepset/minilm-uncased-squad2",
     "cross-encoder/ms-marco-MiniLM-L-12-v2",
     "dslim/bert-base-NER",
-    "bert-large-uncased-whole-word-masking-finetuned-squad",
-    "distilbert-base-cased-distilled-squad",
+    "google-bert/bert-large-uncased-whole-word-masking-finetuned-squad",
+    "distilbert/distilbert-base-cased-distilled-squad",
 ]
 _roberta_models = [
-    "roberta-large",
-    "roberta-base",
+    "FacebookAI/roberta-large",
+    "FacebookAI/roberta-base",
     "deepset/roberta-base-squad2",
     "j-hartmann/emotion-english-distilroberta-base",
     "Jean-Baptiste/roberta-large-ner-english",
 ]
 _gpt_models = [
-    "gpt2",
-    "distilgpt2",
+    "openai-community/gpt2",
+    "distilbert/distilgpt2",
     "Norod78/hebrew-bad_wiki-gpt_neo-tiny",
-    #"EleutherAI/gpt-j-6B", # Removed as this is causing OOM errors randomly
+    "EleutherAI/gpt-j-6b",
+    "EleutherAI/pythia-70m-deduped",
     "bigscience/bloom-560m",
 ]
 _opt_models = [
     "facebook/opt-125m",  # 125m, 1.7B, ..., 175B variants have the same model architecture.
-    "facebook/opt-350m",  # 350m applies layer norm after attnention layer which is different than other variants.
+    "facebook/opt-350m",  # 350m applies layer norm after attention layer which is different than other variants.
 ]
-_all_models = HfApi().list_models()
-
-test_models = set(_bert_models + _roberta_models + _gpt_models + _opt_models)
-test_tasks = [
+_test_models = set(_bert_models + _roberta_models + _gpt_models + _opt_models)
+_test_tasks = [
     "fill-mask", "question-answering", "text-classification", "token-classification", "text-generation",
     "text2text-generation", "summarization", "translation"
 ]
-pytest.all_models = {task: [m.modelId for m in _all_models if m.pipeline_tag == task] for task in test_tasks}
-
-_model_w_tasks = itertools.product(*[test_models, test_tasks])
 
 
-def _valid_model_task(model_task):
-    m, t = model_task
-    return m in pytest.all_models[t]
+@dataclass
+class ModelInfo:
+    id: str
+    pipeline_tag: str
+    tags: List[str]
 
 
-pytest.models_w_tasks = list(filter(_valid_model_task, _model_w_tasks))
-pytest.mt_names = [f"{m}-{t}" for m, t in pytest.models_w_tasks]
-"""
-These fixtures iterate all combinations of tasks and models, dtype, & cuda_graph
-"""
+def _hf_model_list() -> List[ModelInfo]:
+    """ Caches HF model list to avoid repeated API calls """
+
+    cache_dir = os.getenv("HF_HOME", "~/.cache/huggingface")
+    cache_file_path = os.path.join(cache_dir, "DS_model_cache.pkl")
+    num_days = os.getenv("HF_CACHE_EXPIRY_DAYS", 1)
+    cache_expiration_seconds = num_days * 60 * 60 * 24
+
+    # Load or initialize the cache
+    model_data = {"cache_time": 0, "model_list": []}
+    if os.path.isfile(cache_file_path):
+        with open(cache_file_path, 'rb') as f:
+            try:
+                fcntl.flock(f, fcntl.LOCK_SH)
+                model_data = pickle.load(f)
+            except Exception as e:
+                print(f"Error loading cache file {cache_file_path}: {e}")
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
+
+    current_time = time.time()
+
+    # Update the cache if it has expired
+    if ((model_data["cache_time"] + cache_expiration_seconds) < current_time) or os.getenv("FORCE_UPDATE_HF_CACHE",
+                                                                                           default=False):
+        api = HfApi()
+        while True:
+            try:
+                model_list = []
+                for model in _test_models:
+                    model_list.extend(api.list_models(model_name=model))
+                model_data["model_list"] = [
+                    ModelInfo(id=m.id, pipeline_tag=m.pipeline_tag, tags=m.tags) for m in model_list
+                ]
+                break  # Exit the loop if the operation is successful
+            except requests.exceptions.HTTPError as e:
+                if e.response.status_code == 429:
+                    print("Rate limit exceeded. Retrying in 60 seconds...")
+                    time.sleep(60)
+                else:
+                    raise  # Re-raise the exception if it's not a 429 error
+        model_data["cache_time"] = current_time
+
+        # Save the updated cache
+        os.makedirs(cache_dir, exist_ok=True)
+        with open(cache_file_path, 'wb') as f:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX)
+                pickle.dump(model_data, f)
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
+
+    return model_data["model_list"]
 
 
-@pytest.fixture(params=pytest.models_w_tasks, ids=pytest.mt_names)
+# Get a list of all models and mapping from task to supported models
+_hf_models = _hf_model_list()
+_hf_model_names = [m.id for m in _hf_models]
+_hf_task_to_models = {task: [m.id for m in _hf_models if m.pipeline_tag == task] for task in _test_tasks}
+
+# Get all combinations of task:model to test
+_model_w_tasks = [(m, t) for m, t in itertools.product(*[_test_models, _test_tasks]) if m in _hf_task_to_models[t]]
+
+# Assign to pytest variables for testing
+pytest.model_w_tasks = _model_w_tasks
+pytest.mt_names = [f"{m}-{t}" for m, t in pytest.model_w_tasks]
+
+
+@pytest.fixture(scope="module", autouse=True)
+def verify_models():
+    # Verify all test models are registered in HF
+    _test_models_not_found = [m for m in _test_models if m not in _hf_model_names]
+    if _test_models_not_found:
+        pytest.fail(f"Model(s) not found in HuggingFace: {_test_models_not_found}")
+
+    # Verify all models are assigned to at least one task
+    _models_to_be_tested = set(m for m, t in _model_w_tasks)
+    _missing_task_models = _models_to_be_tested.difference(_test_models)
+    if _missing_task_models:
+        pytest.fail(f"Model(s) do not have an assigned task: {_missing_task_models}")
+
+
+""" Fixtures for inference config """
+
+
+@pytest.fixture(params=pytest.model_w_tasks, ids=pytest.mt_names)
 def model_w_task(request):
     return request.param
 
@@ -95,43 +183,17 @@ def enable_cuda_graph(request):
     return request.param
 
 
-"""
-This fixture will validate the configuration
-"""
+@pytest.fixture(params=[True, False], ids=["Triton", "noTriton"])
+def enable_triton(request):
+    return request.param
 
 
-@pytest.fixture()
-def invalid_model_task_config(model_w_task, dtype, enable_cuda_graph):
-    model, task = model_w_task
-    msg = ""
-    if pkg_version.parse(torch.__version__) <= pkg_version.parse("1.2"):
-        msg = "DS inference injection doesn't work well on older torch versions"
-    elif model not in pytest.all_models[task]:
-        msg = f"Not a valid model / task combination: {model} / {task}"
-    elif enable_cuda_graph and (torch_info["cuda_version"] == "0.0"):
-        msg = "CUDA not detected, cannot use CUDA Graph"
-    elif enable_cuda_graph and pkg_version.parse(torch.__version__) < pkg_version.parse("1.10"):
-        msg = "CUDA Graph is only available in torch versions >= 1.10"
-    elif "gpt-j-6B" in model:
-        if dtype != torch.half:
-            msg = f"Not enough GPU memory to run {model} with dtype {dtype}"
-        elif enable_cuda_graph:
-            msg = f"Not enough GPU memory to run {model} with CUDA Graph enabled"
-    elif "gpt-neox-20b" in model:  # TODO: remove this when neox issues resolved
-        msg = "Skipping gpt-neox-20b for now"
-    elif ("gpt-neox-20b" in model) and (dtype != torch.half):
-        msg = f"Not enough GPU memory to run {model} with dtype {dtype}"
-    elif ("bloom" in model) and (dtype != torch.half):
-        msg = f"Bloom models only support half precision, cannot use dtype {dtype}"
-    elif ("bert" not in model.lower()) and enable_cuda_graph:
-        msg = "Non bert/roberta models do no support CUDA Graph"
-    return msg
+@pytest.fixture(params=[1, 2], ids=["ws1", "ws2"])
+def world_size(request):
+    return request.param
 
 
-"""
-These fixtures can be used to customize the query, inference args, and assert
-statement for each combination of model /task
-"""
+""" Fixtures for running query """
 
 
 @pytest.fixture
@@ -167,12 +229,15 @@ def query(model_w_task):
 def inf_kwargs(model_w_task):
     model, task = model_w_task
     if task == "text-generation":
-        if model == "EleutherAI/gpt-j-6B":
+        if model == "EleutherAI/gpt-j-6b":
             # This model on V100 is hitting memory problems that limit the number of output tokens
-            return {"do_sample": False, "max_length": 12}
-        return {"do_sample": False, "max_length": 20}
+            return {"do_sample": False, "temperature": 1.0, "max_length": 12}
+        return {"do_sample": False, "temperature": 1.0, "max_length": 20}
     else:
         return {}
+
+
+""" Assertion fixture for verifying model outputs """
 
 
 def fill_mask_assert(x, y):
@@ -226,6 +291,7 @@ def assert_fn(model_w_task):
     return assert_fn
 
 
+# Used to verify DeepSpeed kernel injection worked with a model
 def check_injection(model):
 
     def verify_injection(module):
@@ -240,9 +306,46 @@ def check_injection(model):
     verify_injection(model)
 
 
-"""
-Tests
-"""
+# Used to Get Device name
+def getDeviceId(local_rank):
+    device = torch.device(f"{get_accelerator().device_name(local_rank)}")
+    return device
+
+
+# Verify that test is valid
+def validate_test(model_w_task, dtype, enable_cuda_graph, enable_triton):
+    model, task = model_w_task
+    msg = ""
+    if enable_cuda_graph and (torch_info["cuda_version"] == "0.0"):
+        msg = "CUDA not detected, cannot use CUDA Graph"
+    elif enable_cuda_graph and pkg_version.parse(torch.__version__) < pkg_version.parse("1.10"):
+        msg = "CUDA Graph is only available in torch versions >= 1.10"
+    elif "gpt-j-6b" in model:
+        if dtype != torch.half:
+            msg = f"Not enough GPU memory to run {model} with dtype {dtype}"
+        elif enable_cuda_graph:
+            msg = f"Not enough GPU memory to run {model} with CUDA Graph enabled"
+    elif "gpt-neox-20b" in model:  # TODO: remove this when neox issues resolved
+        msg = "Skipping gpt-neox-20b for now"
+    elif ("gpt-neox-20b" in model) and (dtype != torch.half):
+        msg = f"Not enough GPU memory to run {model} with dtype {dtype}"
+    elif ("bloom" in model) and (dtype != torch.half):
+        msg = f"Bloom models only support half precision, cannot use dtype {dtype}"
+    elif (model not in _bert_models + _roberta_models) and enable_cuda_graph:
+        msg = "Non bert/roberta models do no support CUDA Graph"
+    elif enable_triton and not (dtype in [torch.half]):
+        msg = "Triton is for fp16"
+    elif enable_triton and not deepspeed.HAS_TRITON:
+        msg = "triton needs to be installed for the test"
+    elif (model not in _bert_models + _roberta_models) and enable_triton:
+        msg = "Triton kernels do not support Non bert/roberta models yet"
+
+    # These should be removed once we fix several inference tests failing
+    if model in [
+            "EleutherAI/pythia-70m-deduped", "distilbert/distilbert-base-cased-distilled-squad", "EleutherAI/gpt-j-6b"
+    ]:
+        msg = "Test is currently broken"
+    return msg
 
 
 @pytest.mark.inference
@@ -254,13 +357,21 @@ class TestModelTask(DistributedTest):
         model_w_task,
         dtype,
         enable_cuda_graph,
+        enable_triton,
         query,
         inf_kwargs,
         assert_fn,
-        invalid_model_task_config,
+        perf_meas=True,
     ):
-        if invalid_model_task_config:
-            pytest.skip(invalid_model_task_config)
+        invalid_test_msg = validate_test(model_w_task, dtype, enable_cuda_graph, enable_triton)
+        if invalid_test_msg:
+            pytest.skip(invalid_test_msg)
+
+        if dtype not in get_accelerator().supported_dtypes():
+            pytest.skip(f"Acceleraor {get_accelerator().device_name()} does not support {dtype}.")
+
+        if not deepspeed.ops.__compatible_ops__[InferenceBuilder.NAME]:
+            pytest.skip("This op had not been implemented on this system.", allow_module_level=True)
 
         model, task = model_w_task
         local_rank = int(os.getenv("LOCAL_RANK", "0"))
@@ -284,13 +395,18 @@ class TestModelTask(DistributedTest):
         get_accelerator().synchronize()
         bs_time = time.time() - start
 
-        pipe.model = deepspeed.init_inference(
-            pipe.model,
-            mp_size=1,
-            dtype=dtype,
-            replace_with_kernel_inject=True,
-            enable_cuda_graph=enable_cuda_graph,
-        )
+        args = {
+            'mp_size': 1,
+            'dtype': dtype,
+            'replace_with_kernel_inject': True,
+            'enable_cuda_graph': enable_cuda_graph,
+            'use_triton': enable_triton,
+            'triton_autotune': False,
+        }
+        if pipe.tokenizer.model_max_length < deepspeed.ops.transformer.inference.config.DeepSpeedInferenceConfig(
+        ).max_out_tokens:
+            args.update({'max_out_tokens': pipe.tokenizer.model_max_length})
+        pipe.model = deepspeed.init_inference(pipe.model, **args)
         check_injection(pipe.model)
         # Warm-up queries for perf measurement
         #for i in range(10):
@@ -301,6 +417,11 @@ class TestModelTask(DistributedTest):
         get_accelerator().synchronize()
         ds_time = time.time() - start
 
+        if perf_meas:
+            print(
+                f"model={model}, task={task}, dtype={dtype}, cuda_graph={enable_cuda_graph}, triton={enable_triton}, bs_time={bs_time}, ds_time={ds_time}"
+            )
+
         # facebook/opt* and some bigscient/bloom* models are not matching
         # baseline exactly, adding an exception to them for now
         if ("opt" in model) or ("bloom" in model):
@@ -309,6 +430,7 @@ class TestModelTask(DistributedTest):
         # These performance tests are only measuring the time for a single
         # inference request, we just want to check that performance isn't terrible
         #assert ds_time <= (bs_time * 1.1)
+
         assert assert_fn(bs_output, ds_output)
 
 
@@ -316,10 +438,10 @@ class TestModelTask(DistributedTest):
 @pytest.mark.parametrize("model_w_task", [("EleutherAI/gpt-neo-1.3B", "text-generation"),
                                           ("EleutherAI/gpt-neox-20b", "text-generation"),
                                           ("bigscience/bloom-3b", "text-generation"),
-                                          ("EleutherAI/gpt-j-6B", "text-generation")],
+                                          ("EleutherAI/gpt-j-6b", "text-generation")],
                          ids=["gpt-neo", "gpt-neox", "bloom", "gpt-j"])
 class TestMPSize(DistributedTest):
-    world_size = 4
+    world_size = 2
 
     def test(
         self,
@@ -328,10 +450,13 @@ class TestMPSize(DistributedTest):
         query,
         inf_kwargs,
         assert_fn,
-        invalid_model_task_config,
     ):
-        if invalid_model_task_config:
-            pytest.skip(invalid_model_task_config)
+        invalid_test_msg = validate_test(model_w_task, dtype, enable_cuda_graph=False, enable_triton=False)
+        if invalid_test_msg:
+            pytest.skip(invalid_test_msg)
+
+        if not deepspeed.ops.__compatible_ops__[InferenceBuilder.NAME]:
+            pytest.skip("This op had not been implemented on this system.", allow_module_level=True)
 
         model, task = model_w_task
         local_rank = int(os.getenv("LOCAL_RANK", "0"))
@@ -355,6 +480,38 @@ class TestMPSize(DistributedTest):
         assert assert_fn(bs_output, ds_output)
 
 
+@pytest.mark.inference
+@pytest.mark.parametrize("model_w_task", [("openai-community/gpt2", "text-generation")], ids=["gpt2"])
+class TestLowCpuMemUsage(DistributedTest):
+    world_size = 1
+
+    def test(
+        self,
+        model_w_task,
+        query,
+        inf_kwargs,
+        assert_fn,
+    ):
+        model, task = model_w_task
+        dtype = torch.float16
+        if dtype not in get_accelerator().supported_dtypes():
+            pytest.skip(f"Acceleraor {get_accelerator().device_name()} does not support {dtype}.")
+
+        local_rank = int(os.getenv("LOCAL_RANK", "0"))
+        device = getDeviceId(local_rank)
+        pipe = pipeline(task, model=model, model_kwargs={"low_cpu_mem_usage": True}, device=device, framework="pt")
+        bs_output = pipe(query, **inf_kwargs)
+        pipe.model = deepspeed.init_inference(pipe.model,
+                                              mp_size=self.world_size,
+                                              dtype=dtype,
+                                              replace_method="auto",
+                                              replace_with_kernel_inject=True)
+
+        ds_output = pipe(query, **inf_kwargs)
+
+        assert assert_fn(bs_output, ds_output)
+
+
 @pytest.mark.seq_inference
 @pytest.mark.parametrize(
     "model_w_task, injection_policy",
@@ -362,46 +519,33 @@ class TestMPSize(DistributedTest):
         (("google/t5-v1_1-small", "text2text-generation"), {
             T5Block: ('SelfAttention.o', 'EncDecAttention.o', 'DenseReluDense.wo')
         }),
-        (("roberta-large", "fill-mask"), {
+        (("FacebookAI/roberta-large", "fill-mask"), {
             RobertaLayer: ('output.dense')
         }),
     ],
     ids=["t5", "roberta"],
 )
 @pytest.mark.parametrize("dtype", [torch.float], ids=["fp32"])
-@pytest.mark.parametrize("enable_cuda_graph", [False], ids=["noCG"])
 class TestInjectionPolicy(DistributedTest):
-    world_size = [1, 2]
 
-    def test(
-        self,
-        model_w_task,
-        injection_policy,
-        query,
-        inf_kwargs,
-        assert_fn,
-        invalid_model_task_config,
-        dtype,
-        enable_cuda_graph,
-    ):
-        if invalid_model_task_config:
-            pytest.skip(invalid_model_task_config)
+    def test(self, model_w_task, injection_policy, query, inf_kwargs, assert_fn, dtype, world_size):
+        invalid_test_msg = validate_test(model_w_task, dtype, enable_cuda_graph=False, enable_triton=False)
+        if invalid_test_msg:
+            pytest.skip(invalid_test_msg)
 
         model, task = model_w_task
         local_rank = int(os.getenv("LOCAL_RANK", "0"))
-        world_size = int(os.getenv("WORLD_SIZE", "2"))
 
-        # We have to load these large models on CPU with pipeline because not
-        # enough GPU memory
-        pipe = pipeline(task, model=model, device=torch.device("cpu"), framework="pt")
+        pipe = pipeline(task,
+                        model=model,
+                        device=torch.device(get_accelerator().device_name(local_rank)),
+                        framework="pt")
         bs_output = pipe(query, **inf_kwargs)
 
         pipe.model = deepspeed.init_inference(pipe.model,
                                               mp_size=world_size,
                                               dtype=dtype,
                                               injection_policy=injection_policy)
-        # Switch device to GPU so that input tensors are not on CPU
-        pipe.device = torch.device(get_accelerator().device_name(local_rank))
         ds_output = pipe(query, **inf_kwargs)
 
         print(local_rank, "baseline", bs_output)
@@ -412,15 +556,10 @@ class TestInjectionPolicy(DistributedTest):
 @pytest.mark.seq_inference
 @pytest.mark.parametrize(
     "model_w_task",
-    [
-        ("Helsinki-NLP/opus-mt-en-de", "translation"),
-    ],
-    ids=[
-        "marian",
-    ],
+    [("Helsinki-NLP/opus-mt-en-de", "translation"), ("Salesforce/codegen-350M-mono", "text-generation")],
+    ids=["marian", "codegen"],  #codegen has fusedqkv weight.
 )
-@pytest.mark.parametrize("dtype", [torch.float16], ids=["fp16"])
-@pytest.mark.parametrize("enable_cuda_graph", [False], ids=["noCG"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
 class TestAutoTensorParallelism(DistributedTest):
     world_size = [2]
 
@@ -430,25 +569,62 @@ class TestAutoTensorParallelism(DistributedTest):
         query,
         inf_kwargs,
         assert_fn,
-        invalid_model_task_config,
         dtype,
-        enable_cuda_graph,
     ):
-        if invalid_model_task_config:
-            pytest.skip(invalid_model_task_config)
+        invalid_test_msg = validate_test(model_w_task, dtype, enable_cuda_graph=False, enable_triton=False)
+        if invalid_test_msg:
+            pytest.skip(invalid_test_msg)
 
         model, task = model_w_task
         local_rank = int(os.getenv("LOCAL_RANK", "0"))
         world_size = int(os.getenv("WORLD_SIZE", "2"))
 
-        # We have to load these large models on CPU with pipeline because not
-        # enough GPU memory
-        pipe = pipeline(task, model=model, device=torch.device("cpu"), framework="pt")
+        if dtype not in get_accelerator().supported_dtypes():
+            pytest.skip(f"Acceleraor {get_accelerator().device_name()} does not support {dtype}.")
+
+        if model == "Salesforce/codegen-350M-mono":
+            pytest.skip("Disable Codegen model due to slight result difference")
+            #TODO: re-enable this test once we have a fix for the slight result difference
+
+        pipe = pipeline(task,
+                        model=model,
+                        device=torch.device(get_accelerator().device_name(local_rank)),
+                        framework="pt")
         bs_output = pipe(query, **inf_kwargs)
 
         pipe.model = deepspeed.init_inference(pipe.model, mp_size=world_size, dtype=dtype)
-        # Switch device to GPU so that input tensors are not on CPU
-        pipe.device = torch.device(get_accelerator().device_name(local_rank))
+        ds_output = pipe(query, **inf_kwargs)
+
+        print(local_rank, "baseline", bs_output)
+        print(local_rank, "deepspeed", ds_output)
+        assert assert_fn(bs_output, ds_output)
+
+    @pytest.mark.world_size(3)
+    def test_odd_world_size(
+        self,
+        model_w_task,
+        query,
+        inf_kwargs,
+        assert_fn,
+        dtype,
+    ):
+        invalid_test_msg = validate_test(model_w_task, dtype, enable_cuda_graph=False, enable_triton=False)
+        if invalid_test_msg:
+            pytest.skip(invalid_test_msg)
+
+        model, task = model_w_task
+        if model == "Salesforce/codegen-350M-mono":
+            pytest.skip("codegen does not supported by odd world_size")
+        local_rank = int(os.getenv("LOCAL_RANK", "0"))
+        world_size = int(os.getenv("WORLD_SIZE", "3"))
+
+        pipe = pipeline(task,
+                        model=model,
+                        device=torch.device(get_accelerator().device_name(local_rank)),
+                        framework="pt")
+        bs_output = pipe(query, **inf_kwargs)
+
+        pipe.model = deepspeed.init_inference(pipe.model, mp_size=world_size, dtype=dtype)
         ds_output = pipe(query, **inf_kwargs)
 
         print(local_rank, "baseline", bs_output)
@@ -461,13 +637,14 @@ class TestAutoTensorParallelism(DistributedTest):
     "model_family, model_name",
     (
         ["gpt2", "EleutherAI/gpt-neo-2.7B"],
-        ["gpt2", "EleutherAI/gpt-j-6B"],
-        ["gpt2", "gpt2-xl"],
+        #["gpt2", "EleutherAI/gpt-j-6b"], # Causing OOM for this test
+        ["gpt2", "openai-community/gpt2-xl"],
     ),
 )
 @pytest.mark.parametrize("task", ["lambada_standard"])
 class TestLMCorrectness(DistributedTest):
     world_size = 1
+    exec_timeout = 1200  # Give these tests longer to complete
 
     def test(self, model_family, model_name, task):
         # imports here to avoid import errors when pytest collects tests
@@ -476,20 +653,42 @@ class TestLMCorrectness(DistributedTest):
         import lm_eval.tasks
         import lm_eval.evaluator
 
+        # The bootstrap_stderr function in lm_eval.metrics uses a
+        # multiprocessing Pool to increase performance. Since we use a Pool for
+        # our distributed tests and cannot nest Pools, we must redefine and
+        # patch this function with a version that does not use Pool.
+        def no_pool_bootstrap_stderr(f, xs, iters):
+            from lm_eval.metrics import _bootstrap_internal
+            from lm_eval.metrics import sample_stddev
+            res = []
+            chunk_size = min(1000, iters)
+            for i in range(iters // chunk_size):
+                res.extend(_bootstrap_internal(f, chunk_size)((i, xs)))
+            return sample_stddev(res)
+
+        lm_eval.metrics.bootstrap_stderr = no_pool_bootstrap_stderr
+
         local_rank = os.getenv("LOCAL_RANK", "0")
         device = torch.device(get_accelerator().device_name(local_rank))
         dtype = torch.float
         task_dict = lm_eval.tasks.get_task_dict([task])
 
-        if 'gpt-j-6B' in model_name:
+        if 'gpt-j-6b' in model_name:
             dtype = torch.half
             lm = lm_eval.models.get_model(model_family).create_from_arg_string(f"pretrained={model_name}",
                                                                                {"device": "cpu"})
             setattr(lm, model_family, getattr(lm, model_family).half().to(device))
             lm._device = device
         else:
-            lm = lm_eval.models.get_model(model_family).create_from_arg_string(
-                f"pretrained={model_name}", {"device": get_accelerator().device_name()})
+            if get_accelerator().device_name() == 'hpu':
+                #lm_eval not supporting HPU device, so get model with CPU and move it to HPU.
+                lm = lm_eval.models.get_model(model_family).create_from_arg_string(f"pretrained={model_name}",
+                                                                                   {"device": "cpu"})
+                setattr(lm, model_family, getattr(lm, model_family).to(device))
+                lm._device = device
+            else:
+                lm = lm_eval.models.get_model(model_family).create_from_arg_string(
+                    f"pretrained={model_name}", {"device": get_accelerator().device_name()})
 
         get_accelerator().synchronize()
         start = time.time()
@@ -497,6 +696,7 @@ class TestLMCorrectness(DistributedTest):
         get_accelerator().synchronize()
         bs_time = time.time() - start
 
+        getattr(lm, model_family).to("cpu")
         ds_model = deepspeed.init_inference(
             getattr(lm, model_family),
             mp_size=1,

@@ -5,10 +5,15 @@
 
 import deepspeed
 
+import pytest
 from unit.common import DistributedTest
 from unit.simple_model import *
 
 from unit.checkpoint.common import checkpoint_correctness_verification
+from deepspeed.ops.op_builder import FusedAdamBuilder
+
+if not deepspeed.ops.__compatible_ops__[FusedAdamBuilder.NAME]:
+    pytest.skip("This op had not been implemented on this system.", allow_module_level=True)
 
 
 class TestLatestCheckpoint(DistributedTest):
@@ -33,8 +38,8 @@ class TestLatestCheckpoint(DistributedTest):
                                             tmpdir=tmpdir,
                                             load_optimizer_states=True,
                                             load_lr_scheduler_states=False,
-                                            fp16=False,
-                                            empty_tag=True)
+                                            empty_tag=True,
+                                            dtype=torch.float)
 
     def test_missing_latest(self, tmpdir):
         config_dict = {

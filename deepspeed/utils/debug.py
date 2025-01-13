@@ -11,6 +11,13 @@ module_names = {}
 param_names = {}
 
 
+def debug_clear_module_and_param_names():
+    global module_names
+    global param_names
+    module_names = {}
+    param_names = {}
+
+
 def debug_extract_module_and_param_names(model):
     # extract the fully qualified names as soon as the model is acquired
     global module_names
@@ -83,7 +90,7 @@ def printflock(*msgs):
 
     """
     global fcntl
-    if fcntl == None:
+    if fcntl is None:
         import fcntl
 
     with open(__file__, "r") as fh:

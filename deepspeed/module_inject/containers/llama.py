@@ -4,7 +4,7 @@
 # DeepSpeed Team
 
 from .base import *
-from .features import MetaTensorContainer, HybridSplitQKVContainer, HybridGatedMLPContainer
+from .features import HybridSplitQKVContainer, HybridGatedMLPContainer, MetaTensorContainer
 from deepspeed.utils.types import ActivationFuncType, NormType
 from deepspeed.model_implementations.transformers.ds_gpt import DeepSpeedGPTInference
 import torch
@@ -34,6 +34,7 @@ class DS_LLAMAContainer(MetaTensorContainer, HybridGatedMLPContainer, HybridSpli
         _config.rotate_half = True
         _config.rotate_every_two = False
         _config.rotary_dim = self.hidden_size // self.num_attention_heads
+        _config.rope_theta = self.policy.client_module.self_attn.rope_theta
         self.module = DeepSpeedGPTInference(_config, mp_group=self.mp_group)
 
         return self.module
@@ -50,6 +51,12 @@ class DS_LLAMAContainer(MetaTensorContainer, HybridGatedMLPContainer, HybridSpli
                 self.policy.client_module.self_attn.o_proj.weight
             ]
         ]
+
+    def get_lora_matched_pair(self):
+        up_proj_lora, gate_proj_lora, down_proj_lora, q_lora, k_lora, v_lora, out_lora = self.get_lora_params()
+        ret = [(up_proj_lora, self.inter_up_w), (gate_proj_lora, self.inter_gate_w), (down_proj_lora, self._4hh_w),
+               (out_lora, self.dense_w), (q_lora, self.qw), (k_lora, self.kw), (v_lora, self.vw)]
+        return ret
 
     def set_q_k_v(self):
         """
@@ -80,8 +87,8 @@ class DS_LLAMAContainer(MetaTensorContainer, HybridGatedMLPContainer, HybridSpli
             'mlp.up_proj.weight', \
             'mlp.gate_proj.weight', \
             'mlp.down_proj.weight', \
-            'input_layernorm.weight', \
-            'post_attention_layernorm.weight'
+            'post_attention_layernorm.weight', \
+            'input_layernorm.weight',
         )
 
         maybe_copy_qkv(module.attention,
@@ -97,8 +104,12 @@ class DS_LLAMAContainer(MetaTensorContainer, HybridGatedMLPContainer, HybridSpli
                          [prefix + param_names[4], prefix + param_names[5]])
         maybe_copy(module.mlp, sd, weight_quantizer, mp_replace, 'output_w', prefix + param_names[6])
 
-        maybe_copy(module, sd, weight_quantizer, mp_replace, transformer_param_names[8], prefix + param_names[7])
+        maybe_copy(module.mlp, sd, weight_quantizer, mp_replace, transformer_param_names[8], prefix + param_names[7])
         maybe_copy(module, sd, weight_quantizer, mp_replace, transformer_param_names[10], prefix + param_names[8])
+
+        # This line is necessary for proper output when kernels + meta tensors are used in Llama models
+        # TODO: Investigate root-cause and fix meta tensor loading
+        module.mlp.output_b = None
 
 
 class LLAMALayerPolicy(TransformerPolicy):
@@ -117,10 +128,13 @@ class LLAMALayerPolicy(TransformerPolicy):
             LLAMALayerPolicy._orig_layer_class = None
 
     def get_hidden_heads(self):
-        return self.client_module.self_attn.q_proj.weight.shape[1], \
-                self.client_module.self_attn.num_heads, \
-                self.client_module.input_layernorm.variance_epsilon, \
-                self.client_module.mlp.gate_proj.weight.shape[0]
+        hidden_heads = (
+            self.client_module.self_attn.q_proj.in_features,
+            self.client_module.self_attn.num_heads,
+            self.client_module.input_layernorm.variance_epsilon,
+            self.client_module.mlp.gate_proj.out_features,
+        )
+        return hidden_heads
 
     def attention(self, enable_training=False):
         qw = self.client_module.self_attn.q_proj.weight

@@ -78,7 +78,7 @@ class ContiguousMemoryAllocator(object):
         return ret_tensor
 
     #assigns the tensor data to the param data and keeps track of the assignment
-    #any change the the underlying buffer from defragmentation will cause a
+    #any change the underlying buffer from defragmentation will cause a
     #reassignment of the param data
     def assign_to_param(self, tensor, param, numel, shape):
         tensor_id = id(tensor)
@@ -193,7 +193,7 @@ class ContiguousMemoryAllocator(object):
             tensor = self.tensor_map[self.tensor_ids[tensor_addr]]
 
             assert tensor_size == tensor.numel(), \
-                "Size mismatch. {tensor_size} is allocated at addr {tensor_addr} but tensor size is {tensor.numel()} "
+                f"Size mismatch. {tensor_size} is allocated at addr {tensor_addr} but tensor size is {tensor.numel()} "
 
             assert empty_addr != tensor_addr, \
                 f"Cannot have same empty address {empty_addr} and tensor address {tensor_addr}"

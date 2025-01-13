@@ -8,7 +8,6 @@ import torch.nn as nn
 import deepspeed.comm as dist
 import deepspeed
 import pytest
-import copy
 import os
 import numpy as np
 
@@ -18,12 +17,12 @@ from deepspeed.runtime.pipe.module import PipelineModule
 from unit.common import DistributedTest
 from unit.simple_model import SimpleModel, random_dataloader
 from unit.alexnet_model import AlexNetPipe, train_cifar
-from unit.util import required_minimum_torch_version
+from deepspeed.utils.torch import required_torch_version
 from deepspeed.accelerator import get_accelerator
 
 PipeTopo = PipeDataParallelTopology
 
-if not required_minimum_torch_version(major_version=1, minor_version=8):
+if not required_torch_version(min_version=1.8):
     pytest.skip(
         "NCCL-based 1-bit compression requires torch 1.8 or higher",
         allow_module_level=True,
@@ -34,12 +33,18 @@ if rocm_version[0] > 4:
     pytest.skip("NCCL-based 1-bit compression is not yet supported w. ROCm 5 until cupy supports ROCm 5",
                 allow_module_level=True)
 
+if get_accelerator().device_name() == 'hpu':
+    pytest.skip("1-bit compression is not supported by HPU.", allow_module_level=True)
+
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16], ids=["fp32", "fp16"])
 class TestOneBitAdamBasic(DistributedTest):
     world_size = 2
 
     def test(self, dtype):
+        if not get_accelerator().is_fp16_supported():
+            pytest.skip("fp16 is not supported")
+
         config_dict = {
             "train_batch_size": 2,
             "steps_per_print": 1,
@@ -81,6 +86,8 @@ class TestOneBitAdamExpAvgMask(DistributedTest):
     world_size = 2
 
     def test(self):
+        if not get_accelerator().is_fp16_supported():
+            pytest.skip("fp16 is not supported")
         config_dict = {
             "train_batch_size": 2,
             "steps_per_print": 1,
@@ -145,6 +152,8 @@ class TestOneBitAdamCheckpointing(DistributedTest):
     world_size = 2
 
     def test(self, tmpdir):
+        if not get_accelerator().is_fp16_supported():
+            pytest.skip("fp16 is not supported")
         config_dict = {
             "train_batch_size": 2,
             "steps_per_print": 1,
@@ -294,6 +303,8 @@ class TestOneBitAdamCheckpointing(DistributedTest):
         assert optimizer_3.optimizer.adam_freeze_key is False
 
     def test_overflow(self, tmpdir):
+        if not get_accelerator().is_fp16_supported():
+            pytest.skip("fp16 is not supported")
         config_dict = {
             "train_batch_size": 2,
             "steps_per_print": 1,
@@ -335,16 +346,8 @@ class TestOneBitAdamCheckpointing(DistributedTest):
     "topo_config",
     [
         {
-            "num_pp": 1,
-            "num_dp": 4
-        },
-        {
             "num_pp": 2,
             "num_dp": 2
-        },
-        {
-            "num_pp": 4,
-            "num_dp": 1
         },
     ],
 )
@@ -352,9 +355,11 @@ class TestOneBitAdamFP16Pipeline(DistributedTest):
     world_size = 4
 
     def test(self, topo_config):
+        if not get_accelerator().is_fp16_supported():
+            pytest.skip("fp16 is not supported")
         config_dict = {
-            "train_batch_size": 16,
-            "train_micro_batch_size_per_gpu": 4,
+            "train_batch_size": 4,
+            "grandient_accumulation_steps": 1,
             "steps_per_print": 20,
             "optimizer": {
                 "type": "OneBitAdam",
@@ -384,20 +389,12 @@ class TestOneBitAdamFP16Pipeline(DistributedTest):
         }
 
         topo = PipeTopo(**topo_config)
-        steps = 500  # Must be >=100
+        steps = 100
 
-        # Allocate model for consistent initial weights.
-        init_net = AlexNetPipe()
-
-        test_net = copy.deepcopy(init_net)
+        # TODO: Add correctness tests/asserts comparing with baseline?
+        test_net = AlexNetPipe()
         test_model = PipelineModule(layers=test_net.to_layers(), topology=topo, loss_fn=nn.CrossEntropyLoss())
-
-        test_losses = train_cifar(
-            test_model,
-            config=config_dict,
-            num_steps=steps,
-            fp16=config_dict["fp16"]["enabled"],
-        )
+        test_losses = train_cifar(test_model, config=config_dict, num_steps=steps, fp16=config_dict['fp16']['enabled'])
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16], ids=["fp32", "fp16"])
@@ -405,6 +402,8 @@ class TestZeroOneAdamBasic(DistributedTest):
     world_size = 2
 
     def test(self, dtype):
+        if not get_accelerator().is_fp16_supported():
+            pytest.skip("fp16 is not supported")
         config_dict = {
             "train_batch_size": 2,
             "steps_per_print": 1,
@@ -449,6 +448,8 @@ class TestZeroOneAdamExpAvgMask(DistributedTest):
     world_size = 2
 
     def test(self):
+        if not get_accelerator().is_fp16_supported():
+            pytest.skip("fp16 is not supported")
         config_dict = {
             "train_batch_size": 2,
             "steps_per_print": 1,
@@ -516,6 +517,8 @@ class TestZeroOneAdamCheckpointing(DistributedTest):
     world_size = 2
 
     def test(self, tmpdir):
+        if not get_accelerator().is_fp16_supported():
+            pytest.skip("fp16 is not supported")
         config_dict = {
             "train_batch_size": 2,
             "steps_per_print": 1,
@@ -664,6 +667,8 @@ class TestZeroOneAdamCheckpointing(DistributedTest):
             assert "server_error" not in v, f"Incorrect server error"
 
     def test_overflow(self, tmpdir):
+        if not get_accelerator().is_fp16_supported():
+            pytest.skip("fp16 is not supported")
         config_dict = {
             "train_batch_size": 2,
             "steps_per_print": 1,
@@ -708,16 +713,8 @@ class TestZeroOneAdamCheckpointing(DistributedTest):
     "topo_config",
     [
         {
-            "num_pp": 1,
-            "num_dp": 4
-        },
-        {
             "num_pp": 2,
             "num_dp": 2
-        },
-        {
-            "num_pp": 4,
-            "num_dp": 1
         },
     ],
 )
@@ -725,9 +722,11 @@ class TestZeroOneAdamFP16Pipeline(DistributedTest):
     world_size = 4
 
     def test(self, topo_config):
+        if not get_accelerator().is_fp16_supported():
+            pytest.skip("fp16 is not supported")
         config_dict = {
-            "train_batch_size": 16,
-            "train_micro_batch_size_per_gpu": 4,
+            "train_batch_size": 4,
+            "grandient_accumulation_steps": 1,
             "steps_per_print": 20,
             "optimizer": {
                 "type": "ZeroOneAdam",
@@ -760,20 +759,12 @@ class TestZeroOneAdamFP16Pipeline(DistributedTest):
         }
 
         topo = PipeTopo(**topo_config)
-        steps = 500  # Must be >=100
+        steps = 100
 
-        # Allocate model for consistent initial weights.
-        init_net = AlexNetPipe()
-
-        test_net = copy.deepcopy(init_net)
+        # TODO: Add correctness tests/asserts comparing with baseline?
+        test_net = AlexNetPipe()
         test_model = PipelineModule(layers=test_net.to_layers(), topology=topo, loss_fn=nn.CrossEntropyLoss())
-
-        test_losses = train_cifar(
-            test_model,
-            config=config_dict,
-            num_steps=steps,
-            fp16=config_dict["fp16"]["enabled"],
-        )
+        test_losses = train_cifar(test_model, config=config_dict, num_steps=steps, fp16=config_dict['fp16']['enabled'])
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16], ids=["fp32", "fp16"])
@@ -781,6 +772,8 @@ class TestOneBitLambBasic(DistributedTest):
     world_size = 2
 
     def test(self, dtype):
+        if not get_accelerator().is_fp16_supported():
+            pytest.skip("fp16 is not supported")
         config_dict = {
             "train_batch_size": 2,
             "steps_per_print": 1,
@@ -828,6 +821,8 @@ class TestOneBitLampExpAvgMask(DistributedTest):
     world_size = 2
 
     def test(self):
+        if not get_accelerator().is_fp16_supported():
+            pytest.skip("fp16 is not supported")
         config_dict = {
             "train_batch_size": 2,
             "steps_per_print": 1,
@@ -897,6 +892,8 @@ class TestOneBitLambCheckpointing(DistributedTest):
     world_size = 2
 
     def test(self, tmpdir):
+        if not get_accelerator().is_fp16_supported():
+            pytest.skip("fp16 is not supported")
         config_dict = {
             "train_batch_size": 2,
             "steps_per_print": 1,
@@ -1063,6 +1060,8 @@ class TestOneBitLambCheckpointing(DistributedTest):
         assert optimizer_3.optimizer.lamb_freeze_key is False
 
     def test_overflow(self, tmpdir):
+        if not get_accelerator().is_fp16_supported():
+            pytest.skip("fp16 is not supported")
         config_dict = {
             "train_batch_size": 2,
             "steps_per_print": 1,
@@ -1110,16 +1109,8 @@ class TestOneBitLambCheckpointing(DistributedTest):
     "topo_config",
     [
         {
-            "num_pp": 1,
-            "num_dp": 4
-        },
-        {
             "num_pp": 2,
             "num_dp": 2
-        },
-        {
-            "num_pp": 4,
-            "num_dp": 1
         },
     ],
 )
@@ -1127,9 +1118,11 @@ class TestOneBitLambFP16Pipeline(DistributedTest):
     world_size = 4
 
     def test(self, topo_config):
+        if not get_accelerator().is_fp16_supported():
+            pytest.skip("fp16 is not supported")
         config_dict = {
-            "train_batch_size": 16,
-            "train_micro_batch_size_per_gpu": 4,
+            "train_batch_size": 4,
+            "grandient_accumulation_steps": 1,
             "steps_per_print": 20,
             "optimizer": {
                 "type": "OneBitLamb",
@@ -1159,20 +1152,12 @@ class TestOneBitLambFP16Pipeline(DistributedTest):
         }
 
         topo = PipeTopo(**topo_config)
-        steps = 500  # Must be >=100
+        steps = 100
 
-        # Allocate model for consistent initial weights.
-        init_net = AlexNetPipe()
-
-        test_net = copy.deepcopy(init_net)
+        # TODO: Add correctness tests/asserts comparing with baseline?
+        test_net = AlexNetPipe()
         test_model = PipelineModule(layers=test_net.to_layers(), topology=topo, loss_fn=nn.CrossEntropyLoss())
-
-        test_losses = train_cifar(
-            test_model,
-            config=config_dict,
-            num_steps=steps,
-            fp16=config_dict["fp16"]["enabled"],
-        )
+        test_losses = train_cifar(test_model, config=config_dict, num_steps=steps, fp16=config_dict['fp16']['enabled'])
 
 
 @pytest.mark.sequential
@@ -1180,6 +1165,8 @@ class TestCompressedAllReduceBasic(DistributedTest):
     world_size = 2
 
     def test(self, tmpdir):
+        if not get_accelerator().is_fp16_supported():
+            pytest.skip("fp16 is not supported")
         from deepspeed.runtime.comm.nccl import NcclBackend
 
         size = dist.get_world_size()

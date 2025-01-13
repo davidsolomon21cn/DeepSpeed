@@ -17,6 +17,8 @@ lnav:
     url: /inference/
   - title: 'Compression'
     url: /compression/
+  - title: 'Science'
+    url: /deepspeed4science/
   - title: 'Getting Started'
     url: /getting-started/
   - title: 'ds_config'
@@ -39,7 +41,7 @@ lnav:
       - title: 'Flops Profiler'
         url: /docs/config-json/#flops-profiler
       - title: 'Monitoring'
-        url: /docs/config-json/#monitoring-module-tensorboard-wandb-csv
+        url: /docs/config-json/#monitoring-module
       - title: 'Communication Logging'
         url: /docs/config-json/#communication-logging
       - title: 'Model Compression'
@@ -53,6 +55,10 @@ lnav:
         url: /getting-started/
       - title: 'Getting started on Azure'
         url: /tutorials/azure/
+      - title: 'Accelerator Abstraction'
+        url: /tutorials/accelerator-abstraction-interface/
+      - title: 'Accelerator Setup Guides'
+        url: /tutorials/accelerator-setup-guide/
       - title: 'Automatic Tensor Parallelism'
         url: /tutorials/automatic-tensor-parallelism/
       - title: 'Autotuning'
@@ -67,6 +73,12 @@ lnav:
         url: /tutorials/curriculum-learning/
       - title: 'Data Efficiency'
         url: /tutorials/data-efficiency/
+      - title: 'DeepNVMe'
+        url: /tutorials/deepnvme/
+      - title: 'Domino'
+        url: /tutorials/domino/
+      - title: 'DS4Sci_EvoformerAttention'
+        url: /tutorials/ds4sci_evoformerattention/
       - title: 'Flops Profiler'
         url: /tutorials/flops-profiler/
       - title: 'PyTorch Profiler'
@@ -113,5 +125,7 @@ lnav:
         url: /tutorials/zero-offload/
       - title: 'ZeRO'
         url: /tutorials/zero/
+      - title: 'ZeRO++'
+        url: /tutorials/zeropp/
   - title: 'Contributing'
     url: /contributing/

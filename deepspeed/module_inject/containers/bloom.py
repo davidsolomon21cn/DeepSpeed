@@ -5,6 +5,7 @@
 
 from .base import *
 from .features.meta_tensor import MetaTensorContainer
+from .features.hybrid_engine import HybridEngineContainer
 from deepspeed.model_implementations.transformers.ds_bloom import DeepSpeedBloomInference
 from ..policy import TransformerPolicy
 from ..policy import transformer_param_names
@@ -15,24 +16,57 @@ from ..policy import maybe_get_lora
 supported_models = {None}
 
 
-class DS_BloomContainer(MetaTensorContainer, BaseTransformerContainer):
+class DS_BloomContainer(MetaTensorContainer, HybridEngineContainer, BaseTransformerContainer):
 
     def __init__(self, **kwargs):
+        # Check transformers version, error if > 4.43.4 (breaks at 4.44.0)
+        from importlib.metadata import version
+        v_transformers = version('transformers')
+        vers = v_transformers.split('.')
+        major = int(vers[0])
+        minor = int(vers[1])
+        if major > 4 or (major == 4 and minor > 43):
+            import sys
+            sys.exit(
+                f"Transformers version {v_transformers} exceeds version 4.43.4! After transformers version 4.43.4, BLOOM inference with DeepSpeed is no longer supported."
+            )
+
         super().__init__(**kwargs)
 
         # All model specific things should be defined here instead of the base class.
         self.bigscience_bloom = True
+        self.triangular_masking = False
 
     def create_module(self, config=None):
         _config = config if config is not None else self.ds_model_config
 
         self.module = DeepSpeedBloomInference(_config, mp_group=self.mp_group)
         self.module.config.scale_attention = self.scale_attention
+        self.module.config.invert_mask = False
         return self.module
 
     def attention_qkv_mp(self, mp_replace, reversed_dim=False):
         self.module.attention.attn_qkvw = mp_replace.copy(self.module.attention.attn_qkvw, self.qkvw)
         self.module.attention.attn_qkvb = mp_replace.copy(self.module.attention.attn_qkvb, self.qkvb)
+
+    def get_lora_matched_pair(self):
+        """
+        Necessary to implement for `HybridEngineContainer`
+        """
+        fc1_lora, fc2_lora, qkv_lora, out_lora = self.get_lora_params()
+        ret = [(fc1_lora, self._h4h_w), (fc2_lora, self._4hh_w), (qkv_lora, self.qkvw), (out_lora, self.dense_w)]
+        return ret
+
+    def set_lora_params(self):
+        """
+        Necessary to implement for `HybridEngineContainer`
+        """
+        self.lora_params = [
+            maybe_get_lora(p) for p in [
+                self.policy.client_module.mlp.dense_h_to_4h, self.policy.client_module.mlp.dense_4h_to_h, self.policy.
+                client_module.self_attention.query_key_value, self.policy.client_module.self_attention.dense
+            ]
+        ]
 
     def load_params(self, module, sd, weight_quantizer, mp_replace, prefix):
         param_names = (
@@ -107,14 +141,3 @@ class BLOOMLayerPolicy(TransformerPolicy):
                self.client_module.post_attention_layernorm.bias, \
                self.client_module.input_layernorm.weight, \
                self.client_module.input_layernorm.bias
-
-    def get_lora_params(self):
-        all_lora_params = []
-        for p in [
-            self.client_module.mlp.dense_h_to_4h, \
-            self.client_module.mlp.dense_4h_to_h, \
-            self.client_module.self_attention.query_key_value, \
-            self.client_module.self_attention.dense
-            ]:
-            all_lora_params.append(maybe_get_lora(p))
-        return all_lora_params

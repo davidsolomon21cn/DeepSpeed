@@ -4,6 +4,8 @@
 # DeepSpeed Team
 
 from abc import ABC, abstractmethod
+from packaging import version as pkg_version
+import torch
 
 
 class MetaTensorContainer(ABC):
@@ -14,6 +16,8 @@ class MetaTensorContainer(ABC):
     """
 
     def __init__(self, **kwargs):
+        if pkg_version.parse('1.10') > pkg_version.parse(torch.__version__):
+            raise NotImplementedError("Meta tensor support is not available, please upgrade to torch 1.10+")
         super().__init__(**kwargs)
         self.is_meta = False
         self.ckpt_load_enabled = True
@@ -48,7 +52,7 @@ class MetaTensorContainer(ABC):
         """
         Load all the transformer parameter from the checkpoint file (sd).
         In addition to the parameter names, we require two
-        more parameters to help read the the data correctly
+        more parameters to help read the data correctly
         from the checkpoint and split the qkv heads in the
         right order:
             1. `use_load_prefix` (Default: False): this specifies

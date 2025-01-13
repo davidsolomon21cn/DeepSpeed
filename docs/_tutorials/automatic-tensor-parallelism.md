@@ -121,43 +121,60 @@ The following results were collected using V100 SXM2 32GB GPUs.
 The following model families have been successfully tested with automatic tensor parallelism. Other models may work but have not been tested yet.
 
 - albert
+- arctic
+- baichuan
 - bert
 - bigbird_pegasus
+- bloom
 - camembert
+- chatglm2
+- chatglm3
+- codegen
+- codellama
 - deberta_v2
 - electra
 - ernie
 - esm
+- falcon
+- glm
 - gpt-j
 - gpt-neo
 - gpt-neox
 - longt5
 - luke
 - llama
+- llama2
 - m2m_100
 - marian
+- mistral
+- mixtral
+- mpt
 - mvp
 - nezha
 - openai
 - opt
 - pegasus
 - perceiver
+- phi
 - plbart
+- qwen
+- qwen2
+- qwen2-moe
 - reformer
 - roberta
 - roformer
 - splinter
+- starcode
 - t5
 - xglm
 - xlm_roberta
 - yoso
-- bloom
+- yuan
 
 # Unsupported Models
 
 The following models are not currently supported with automatic tensor parallelism. They may still be compatible with other DeepSpeed features (e.g., kernel injection for Bloom):
 
-- codegen
 - deberta
 - flaubert
 - fsmt

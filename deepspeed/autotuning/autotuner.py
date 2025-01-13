@@ -101,7 +101,7 @@ class Autotuner:
 
         self.records = {}
         self.optimal_cmd = None
-        self.optmal_ds_config = None
+        self.optimal_ds_config = None
 
         self.mlflow_parent_id = None
 
@@ -248,8 +248,8 @@ class Autotuner:
         return self.autotuning_config.mp_size
 
     def max_train_micro_batch_size_per_gpu(self):
-        if self.max_train_batch_size(
-        ) and self.max_train_batch_size() > 0:  # if the user specifies a max_train_batch_size
+        if self.max_train_batch_size() and self.max_train_batch_size(
+        ) > 0:  # if the user specifies a max_train_batch_size
             max_train_micro_batch_size = self.max_train_batch_size() * self.mp_size() // (
                 self.exp_num_gpus * self.exp_num_nodes)  # gradient accumulation steps >=1
             return min(self.autotuning_config.max_train_micro_batch_size_per_gpu, max_train_micro_batch_size)
@@ -429,9 +429,8 @@ class Autotuner:
             f"The model requires at least {memory_to_string(self.activation_mem, postfix='B')} activation memory for micro batch size 1."
         )
 
-        #TODO: FIX THIS
-        stage = self.user_config.get(ZERO_OPTIMIZATION, {}).get(ZERO_OPTIMIZATION_STAGE, "all")
-        stage = "all"
+        stage = self.user_config.get(ZERO_OPTIMIZATION, {}).get(ZERO_OPTIMIZATION_STAGE, 0)
+
         user_zero_stages = [stage] if not isinstance(stage, list) else stage
         logger.info(f"User-defined zero stages are {stage}.")
 
@@ -638,7 +637,7 @@ class Autotuner:
         logger.info(f"End tuning for space: {tuning_space_name}")
         return max_micro_batch_size, best_mbs, best_metric_val
 
-    def get_plauteu_mbs(self, tuning_space_name):
+    def get_plateau_mbs(self, tuning_space_name):
         if tuning_space_name not in self.records:
             return 0
         space_records = self.records[tuning_space_name]
@@ -662,7 +661,7 @@ class Autotuner:
             return self.model_info["num_params"]
 
     def model_info_profile_run(self):
-        """Does a model information profling experiment that collects the number of model parameters and activation memory.\
+        """Does a model information profiling experiment that collects the number of model parameters and activation memory.\
             The experiment produces a "profile_model_info" folder under self.results_dir.
         Returns:
             [dict]: a model information dictionary, e.g., {"num_params": 335144976, "trainable_num_params": 335144976, "activation_mem_per_gpu": 324358144, "rank": 0}
@@ -684,6 +683,7 @@ class Autotuner:
         exp_config[DS_CONFIG] = ds_config
         exp_config['num_gpus'] = self.exp_num_gpus
         exp_config['num_nodes'] = self.exp_num_nodes
+        exp_config['hostfile'] = self.args.hostfile
         exp_path = os.path.join(self.exps_dir, f'{exp_name}.json')
 
         with open(exp_path, 'w', buffering=BUFSIZE) as fd:
@@ -762,6 +762,7 @@ class Autotuner:
             exp_config[DS_CONFIG] = ds_config
             exp_config['num_gpus'] = self.exp_num_gpus
             exp_config['num_nodes'] = self.exp_num_nodes
+            exp_config['hostfile'] = self.args.hostfile
             exp_path = os.path.join(self.exps_dir, f'{exp_name}.json')
 
             with open(exp_path, 'w', buffering=BUFSIZE) as fd:
@@ -963,8 +964,8 @@ class Autotuner:
                     low = mid + 1
                     self.update_records(tuning_space_name, exp, metric_val, 1)
                     used_micro_batch_sizes.append(mid)
-                    if prev_metric_val and (
-                        (metric_val - prev_metric_val) / prev_metric_val) < METRIC_PERCENT_DIFF_CONST:
+                    if prev_metric_val and ((metric_val - prev_metric_val) /
+                                            prev_metric_val) < METRIC_PERCENT_DIFF_CONST:
                         logger.info(f"performance plateaus at mbs = {low}")
                         break
                     prev_metric_val = metric_val
@@ -986,7 +987,7 @@ class Autotuner:
             if isinstance(gas_in_config, int):
                 gas = gas_in_config
             elif gas_in_config == "auto":  # GRADIENT_ACCUMULATION_STEPS: "auto"
-                val = self.get_val_from_config(GRADIENT_ACCUMULATION_STEPS)
+                val = self.get_val_from_user_args(GRADIENT_ACCUMULATION_STEPS)
                 if val:
                     gas = int(val)
             elif isinstance(gas_in_config, list):
@@ -1025,8 +1026,8 @@ class Autotuner:
         # NUM_GPUS=$(( ${NUM_WORKERS} * ${NUM_GPUS_PER_WORKER} ))
         # DP_SIZE=$(( ${NUM_GPUS} / (${PP_SIZE} * ${MP_SIZE}) ))
         # GRAD_ACC_STEPS=$(( ${TARGET_GLOBAL_BATCH_SIZE} / (${BATCH_SIZE} * ${DP_SIZE}) ))
-        if self.max_train_batch_size(
-        ) and self.max_train_batch_size() > 0:  # if the user specifies a max_train_batch_size
+        if self.max_train_batch_size() and self.max_train_batch_size(
+        ) > 0:  # if the user specifies a max_train_batch_size
             max_train_batch_size_per_gpu = self.max_train_batch_size() * self.mp_size() // (self.exp_num_gpus *
                                                                                             self.exp_num_nodes)
         else:
@@ -1056,6 +1057,7 @@ class Autotuner:
         exp_config[DS_CONFIG] = ds_config
         exp_config['num_gpus'] = self.exp_num_gpus
         exp_config['num_nodes'] = self.exp_num_nodes
+        exp_config['hostfile'] = self.args.hostfile
         exp_path = os.path.join(self.exps_dir, f'{exp_name}.json')
 
         logger.debug(f'run_ds_config exp_name = {exp_name}')
@@ -1093,7 +1095,7 @@ class Autotuner:
                 fd.write("\n")
                 fd.flush()
             self.optimal_cmd = cmd
-            self.optmal_ds_config = ds_config
+            self.optimal_ds_config = ds_config
             logger.info(
                 f"Wrote the optimal DeepSpeed configuration found by autotuning to {ds_config_path}, and the corresponding DeepSpeed command to {cmd_path}"
             )

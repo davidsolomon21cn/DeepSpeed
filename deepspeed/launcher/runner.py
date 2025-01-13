@@ -20,9 +20,12 @@ import collections
 from copy import deepcopy
 import signal
 import time
+from typing import Tuple, List, Dict
+from collections import defaultdict
+import shlex
 
-from .multinode_runner import PDSHRunner, OpenMPIRunner, MVAPICHRunner, SlurmRunner, MPICHRunner
-from .constants import PDSH_LAUNCHER, OPENMPI_LAUNCHER, MVAPICH_LAUNCHER, SLURM_LAUNCHER, MPICH_LAUNCHER
+from .multinode_runner import PDSHRunner, OpenMPIRunner, MVAPICHRunner, SlurmRunner, MPICHRunner, IMPIRunner
+from .constants import PDSH_LAUNCHER, OPENMPI_LAUNCHER, MVAPICH_LAUNCHER, SLURM_LAUNCHER, MPICH_LAUNCHER, IMPI_LAUNCHER
 from ..constants import TORCH_DISTRIBUTED_DEFAULT_PORT
 from ..nebula.constants import NEBULA_EXPORT_ENVS
 from ..utils import logger
@@ -31,11 +34,15 @@ from ..autotuning import Autotuner
 from deepspeed.accelerator import get_accelerator
 
 DLTS_HOSTFILE = "/job/hostfile"
-EXPORT_ENVS = ['MLFLOW', 'NCCL', 'PYTHON', 'MV2', 'UCX']
+EXPORT_ENVS = ['MLFLOW', 'PYTHON', 'MV2', 'UCX']
 EXPORT_ENVS += NEBULA_EXPORT_ENVS
-DEEPSPEED_ENVIRONMENT_NAME = ".deepspeed_env"
+DEEPSPEED_ENVIRONMENT_NAME = os.getenv("DS_ENV_FILE", ".deepspeed_env")
 DEEPSPEED_ENVIRONMENT_PATHS = [os.path.expanduser("~"), '.']
 PDSH_MAX_FAN_OUT = 1024
+
+# On AISC compute, each node sets environment variables independently, want to prevent
+# exporting rank-0 env variables in case of heterogeneous compute.
+EXCLUDE_ENVS = {'AISC_JOB_NAME': ['NCCL_IB_HCA', 'UCX_NET_DEVICES']}
 
 
 def parse_args(args=None):
@@ -95,6 +102,7 @@ def parse_args(args=None):
                         "Default is num_nodes when elastic training is enabled")
 
     parser.add_argument("--num_gpus",
+                        "--num_accelerators",
                         type=int,
                         default=-1,
                         help="Max number of GPUs to use on each node, will use "
@@ -112,11 +120,17 @@ def parse_args(args=None):
                         help="(optional) IP address of node 0, will be "
                         "inferred via 'hostname -I' if not specified.")
 
+    parser.add_argument("--node_rank",
+                        default=-1,
+                        type=int,
+                        help="ID of each node in the range [0:N). "
+                        "Only required when --no_ssh is set.")
+
     parser.add_argument("--launcher",
                         default=PDSH_LAUNCHER,
                         type=str,
                         help="(optional) choose launcher backend for multi-node "
-                        "training. Options currently include PDSH, OpenMPI, MVAPICH, SLURM, MPICH.")
+                        "training. Options currently include PDSH, OpenMPI, MVAPICH, SLURM, MPICH, IMPI.")
 
     parser.add_argument("--launcher_args",
                         default="",
@@ -139,6 +153,10 @@ def parse_args(args=None):
                         action="store_true",
                         help="Do not pass local_rank as an argument when calling "
                         "the user's training script.")
+
+    parser.add_argument("--no_ssh",
+                        action="store_true",
+                        help="Launch training independently on each node without ssh setup.")
 
     parser.add_argument("--no_ssh_check",
                         action="store_true",
@@ -173,16 +191,22 @@ def parse_args(args=None):
 
     parser.add_argument("user_script", type=str, help="User script to launch, followed by any required "
                         "arguments.")
+
     parser.add_argument('user_args', nargs=argparse.REMAINDER)
+
     parser.add_argument("--bind_cores_to_rank",
                         action="store_true",
                         help="Bind each rank to different cores of the host")
+
     parser.add_argument("--bind_core_list",
                         type=str,
                         default=None,
                         help="List of cores to bind to with comma separated list of "
                         "numbers and range. i.e. 1,3-5,7 => [1,3,4,5,7].  When not "
                         "specified, all cores on system would be used rank binding")
+
+    parser.add_argument("--ssh_port", type=int, default=None, help="SSH port to use for remote connections")
+
     return parser.parse_args(args=args)
 
 
@@ -222,7 +246,7 @@ def _parse_hostfile(hostfile_lines):
             resource_pool[host] = num_slots
         else:
             logger.error(f"Bad hostfile text: {hostfile_lines}")
-            raise ValueError("Hostfile contains a bad entry: {line}, unable to proceed with launching")
+            raise ValueError(f"Hostfile contains a bad entry: {line}, unable to proceed with launching")
 
     if len(resource_pool) == 0:
         logger.error(f"Bad hostfile text: {hostfile_lines}")
@@ -241,6 +265,31 @@ def _stable_remove_duplicates(data):
     return new_list
 
 
+def parse_node_config(node_config: str) -> Tuple[str, List[int]]:
+    SLOT_LIST_START = ':'
+    SLOT_SEP = ','
+
+    if SLOT_LIST_START not in node_config:
+        return node_config, []
+
+    hostname, slots = node_config.split(SLOT_LIST_START)
+    slots = [int(x) for x in slots.split(SLOT_SEP)]
+
+    return hostname, slots
+
+
+def parse_node_config_list(node_config_list: List[str]) -> Dict[str, List[int]]:
+    NODE_SEP = '@'
+
+    node_configs = defaultdict(list)
+
+    for node_config in node_config_list.split(NODE_SEP):
+        hostname, slots = parse_node_config(node_config)
+        node_configs[hostname] += slots
+
+    return {k: sorted(list(set(v))) for k, v in node_configs.items()}
+
+
 def parse_resource_filter(host_info, include_str="", exclude_str=""):
     '''Parse an inclusion or exclusion string and filter a hostfile dictionary.
 
@@ -254,11 +303,6 @@ def parse_resource_filter(host_info, include_str="", exclude_str=""):
         exclude_str="worker-1:0" will use all available resources except
           slot 0 on worker-1.
     '''
-
-    # Constants that define our syntax
-    NODE_SEP = '@'
-    SLOT_LIST_START = ':'
-    SLOT_SEP = ','
 
     # Ensure include/exclude are mutually exclusive
     if (include_str != "") and (exclude_str != ""):
@@ -277,12 +321,9 @@ def parse_resource_filter(host_info, include_str="", exclude_str=""):
         parse_str = exclude_str
 
     # foreach node in the list
-    for node_config in parse_str.split(NODE_SEP):
+    for hostname, slots in parse_node_config_list(parse_str).items():
         # Node can either be alone or node:slot,slot,slot
-        if SLOT_LIST_START in node_config:
-            hostname, slots = node_config.split(SLOT_LIST_START)
-            slots = [int(x) for x in slots.split(SLOT_SEP)]
-
+        if len(slots) > 0:
             # sanity checks
             if hostname not in host_info:
                 raise ValueError(f"Hostname '{hostname}' not found in hostfile")
@@ -300,7 +341,6 @@ def parse_resource_filter(host_info, include_str="", exclude_str=""):
 
         # User just specified the whole node
         else:
-            hostname = node_config
             # sanity check hostname
             if hostname not in host_info:
                 raise ValueError(f"Hostname '{hostname}' not found in hostfile")
@@ -333,8 +373,10 @@ def parse_resource_filter(host_info, include_str="", exclude_str=""):
 
 def parse_inclusion_exclusion(resource_pool, inclusion, exclusion):
     active_resources = collections.OrderedDict()
+    node_configs = parse_node_config_list(inclusion)
+
     for hostname, slots in resource_pool.items():
-        active_resources[hostname] = list(range(slots))
+        active_resources[hostname] = node_configs[hostname] if hostname in node_configs else list(range(slots))
 
     return parse_resource_filter(active_resources, include_str=inclusion, exclude_str=exclusion)
 
@@ -382,18 +424,19 @@ def main(args=None):
 
     resource_pool = fetch_hostfile(args.hostfile)
 
-    # respect CUDA_VISIBLE_DEVICES for a single node and no explicit resource filters
-    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-    if not resource_pool and len(cuda_visible_devices):
-        detected_str = f"Detected CUDA_VISIBLE_DEVICES={cuda_visible_devices}"
+    # respect VISIBLE_DEVICES for a single node and no explicit resource filters
+    visible_devices_env = get_accelerator().visible_devices_envs()[0]
+    visible_devices = os.environ.get(visible_devices_env, "")
+    if not resource_pool and len(visible_devices):
+        detected_str = f"Detected VISIBLE_DEVICES={visible_devices}"
         if len(args.include) or len(args.exclude) or args.num_nodes > 1 or args.num_gpus > 0:
             print(
                 f"{detected_str} but ignoring it because one or several of --include/--exclude/--num_gpus/--num_nodes cl args were used. If you want to use CUDA_VISIBLE_DEVICES don't pass any of these arguments to deepspeed."
             )
         else:
-            args.include = f"localhost:{cuda_visible_devices}"
+            args.include = f"localhost:{visible_devices}"
             print(f"{detected_str}: setting --include={args.include}")
-        del os.environ["CUDA_VISIBLE_DEVICES"]
+        del os.environ[visible_devices_env]
 
     if args.num_nodes >= 0 or args.num_gpus >= 0:
         if args.include != "" or args.exclude != "":
@@ -416,13 +459,15 @@ def main(args=None):
     env = os.environ.copy()
 
     # validate that passwordless-ssh is workly properly with this hostfile
-    if multi_node_exec and not args.no_ssh_check:
+    if multi_node_exec and not args.no_ssh_check and not args.no_ssh:
         first_host = list(active_resources.keys())[0]
         try:
-            subprocess.check_call(f'ssh -o PasswordAuthentication=no {first_host} hostname',
-                                  stderr=subprocess.DEVNULL,
-                                  stdout=subprocess.DEVNULL,
-                                  shell=True)
+            ssh_check_cmd = "ssh -o PasswordAuthentication=no "
+            if args.ssh_port is not None:
+                ssh_check_cmd += f"-p {args.ssh_port} "
+            ssh_check_cmd += f"{first_host} hostname"
+            safe_ssh_cmd = shlex.split(ssh_check_cmd)
+            subprocess.check_call(safe_ssh_cmd, stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
         except subprocess.CalledProcessError:
             raise RuntimeError(
                 f"Using hostfile at {args.hostfile} but host={first_host} was not reachable via ssh. If you are running with a single node please remove {args.hostfile} or setup passwordless ssh."
@@ -431,9 +476,13 @@ def main(args=None):
     if not args.master_addr:
         assert multi_node_exec
         first_host = list(active_resources.keys())[0]
-        hostname_cmd = [f"ssh {first_host} hostname -I"]
+        ssh_check_cmd = "ssh "
+        if args.ssh_port is not None:
+            ssh_check_cmd += f" -p {args.ssh_port}"
+        ssh_check_cmd += f" {first_host} hostname -I"
+        hostname_cmd = shlex.split(ssh_check_cmd)
         try:
-            result = subprocess.check_output(hostname_cmd, shell=True)
+            result = subprocess.check_output(hostname_cmd)
         except subprocess.CalledProcessError as err:
             logger.error(
                 "Unable to detect suitable master address via `hostname -I`, please manually specify one via --master_addr"
@@ -467,16 +516,22 @@ def main(args=None):
     if args.elastic_training:
         assert not args.no_local_rank, "--no_local_rank argument is not supported in Elastic training"
 
+    if args.no_ssh:
+        assert (0 <= args.node_rank <
+                len(active_resources)), "Launching training without ssh, but --node_rank is not set correctly."
+
     # encode world info as base64 to make it easier to pass via command line
     world_info_base64 = encode_world_info(active_resources)
 
-    multi_node_exec = args.force_multi or len(active_resources) > 1
+    multi_node_exec = (args.force_multi or len(active_resources) > 1) and not args.no_ssh
 
     if not multi_node_exec:
         deepspeed_launch = [
             sys.executable, "-u", "-m", "deepspeed.launcher.launch", f"--world_info={world_info_base64}",
             f"--master_addr={args.master_addr}", f"--master_port={args.master_port}"
         ]
+        if args.no_ssh:
+            deepspeed_launch.append(f"--node_rank={args.node_rank}")
         if args.no_python:
             deepspeed_launch.append("--no_python")
         if args.module:
@@ -493,7 +548,7 @@ def main(args=None):
             deepspeed_launch.append(f"--min_elastic_nodes={args.min_elastic_nodes}")
         if args.bind_cores_to_rank:
             deepspeed_launch.append("--bind_cores_to_rank")
-        if args.bind_core_list != None:
+        if args.bind_core_list is not None:
             deepspeed_launch.append(f"--bind_core_list={args.bind_core_list}")
         cmd = deepspeed_launch + [args.user_script] + args.user_args
     else:
@@ -504,6 +559,8 @@ def main(args=None):
             runner = OpenMPIRunner(args, world_info_base64, resource_pool)
         elif args.launcher == MPICH_LAUNCHER:
             runner = MPICHRunner(args, world_info_base64, resource_pool)
+        elif args.launcher == IMPI_LAUNCHER:
+            runner = IMPIRunner(args, world_info_base64, resource_pool)
         elif args.launcher == MVAPICH_LAUNCHER:
             runner = MVAPICHRunner(args, world_info_base64, resource_pool)
         elif args.launcher == SLURM_LAUNCHER:
@@ -520,21 +577,30 @@ def main(args=None):
         else:
             env['PYTHONPATH'] = curr_path
 
-        exports = ""
+        excluded_vars = []
+        for exclude_key, var_list in EXCLUDE_ENVS.items():
+            if exclude_key in env.keys():
+                # key exists in launcher env -> var list should be used
+                excluded_vars += var_list
+
+        # load envs from accelerator
+        exports = EXPORT_ENVS + get_accelerator().export_envs()
         for var in env.keys():
-            if any([var.startswith(name) for name in EXPORT_ENVS]):
-                runner.add_export(var, env[var])
+            if any([var.startswith(name) for name in exports]):
+                if not any([var == name for name in excluded_vars]):
+                    runner.add_export(var, env[var])
 
         for environ_path in DEEPSPEED_ENVIRONMENT_PATHS:
             environ_file = os.path.join(environ_path, DEEPSPEED_ENVIRONMENT_NAME)
             if os.path.isfile(environ_file):
+                logger.info(f"deepspeed_env file = {environ_file}")
                 with open(environ_file, 'r') as fd:
                     for var in fd.readlines():
                         key, val = var.split('=', maxsplit=1)
                         runner.add_export(key, val)
 
         if args.launcher == PDSH_LAUNCHER:
-            cmd, kill_cmd = runner.get_cmd(env, active_resources)
+            cmd, kill_cmd, env = runner.get_cmd(env, active_resources)
         else:
             cmd = runner.get_cmd(env, active_resources)
 
@@ -550,8 +616,9 @@ def main(args=None):
         time.sleep(1)
         sys.exit(1)
 
-    if args.launcher == PDSH_LAUNCHER:
+    if args.launcher == PDSH_LAUNCHER and multi_node_exec:
         signal.signal(signal.SIGINT, sigkill_handler)
+        signal.signal(signal.SIGTERM, sigkill_handler)
 
     result.wait()
 

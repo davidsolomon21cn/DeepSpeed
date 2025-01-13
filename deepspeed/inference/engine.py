@@ -6,7 +6,7 @@
 import torch
 import time
 import os
-
+import deepspeed
 from deepspeed import comm as dist
 from deepspeed.utils.logging import log_dist
 
@@ -14,6 +14,7 @@ from torch.nn.modules import Module
 from packaging import version as pkg_version
 from deepspeed.runtime.checkpoint_engine.torch_checkpoint_engine import TorchCheckpointEngine
 from deepspeed.utils.timer import SynchronizedWallClockTimer
+from deepspeed.runtime.compiler import is_compile_supported
 
 from ..runtime.state_dict_factory import SDLoaderFactory
 from ..runtime.weight_quantizer import WeightQuantization
@@ -27,63 +28,14 @@ from ..module_inject.policy import TransformerPolicy
 from ..module_inject.auto_tp import AutoTP
 
 from ..module_inject.replace_policy import generic_policies
+from ..module_inject.auto_tp_model_utils import build_bloom_alibi_tensor, build_mpt_atten_bias_tensor, build_mpt_alibi_tensor, get_alibi_mask
+from ..ops.transformer.inference.ds_attention import DeepSpeedSelfAttention
+from ..model_implementations.transformers.ds_transformer import DeepSpeedTransformerInference
 
 DS_INFERENCE_ENABLED = False
 from torch import nn
 
 INFERENCE_MODEL_TIMER = "model-forward-inference"
-
-
-def build_bloom_alibi_tensor(attention_mask: torch.Tensor, num_heads: int, dtype: torch.dtype) -> torch.Tensor:
-    """
-    Link to paper: https://arxiv.org/abs/2108.12409 Alibi tensor is not causal as the original paper mentions, it
-    relies on a translation invariance of softmax for quick implementation: with l being a tensor, and a fixed value
-    `softmax(l+a) = softmax(l)`. Based on
-    https://github.com/ofirpress/attention_with_linear_biases/blob/a35aaca144e0eb6b789dfcb46784c4b8e31b7983/fairseq/models/transformer.py#L742
-    TODO @thomasw21 this doesn't work as nicely due to the masking strategy, and so masking varies slightly.
-
-    Args:
-    Returns tensor shaped (batch_size * num_heads, 1, max_seq_len)
-        attention_mask (`torch.Tensor`):
-            Token-wise attention mask, this should be of shape (batch_size, max_seq_len).
-        num_heads (`int`, *required*):
-            number of heads
-        dtype (`torch.dtype`, *optional*, default=`torch.bfloat16`):
-            dtype of the output tensor
-    """
-    import math
-    batch_size, seq_length = attention_mask.shape
-    closest_power_of_2 = 2**math.floor(math.log2(num_heads))
-    base = torch.tensor(2**(-(2**-(math.log2(closest_power_of_2) - 3))),
-                        device=attention_mask.device,
-                        dtype=torch.float32)
-    powers = torch.arange(1, 1 + closest_power_of_2, device=attention_mask.device, dtype=torch.int32)
-    slopes = torch.pow(base, powers)
-
-    if closest_power_of_2 != num_heads:
-        extra_base = torch.tensor(2**(-(2**-(math.log2(2 * closest_power_of_2) - 3))),
-                                  device=attention_mask.device,
-                                  dtype=torch.float32)
-        num_remaining_heads = min(closest_power_of_2, num_heads - closest_power_of_2)
-        extra_powers = torch.arange(1, 1 + 2 * num_remaining_heads, 2, device=attention_mask.device, dtype=torch.int32)
-        slopes = torch.cat([slopes, torch.pow(extra_base, extra_powers)], dim=0)
-
-    # Note: alibi will added to the attention bias that will be applied to the query, key product of attention
-    # => therefore alibi will have to be of shape (batch_size, num_heads, query_length, key_length)
-    # => here we set (batch_size=1, num_heads=num_heads, query_length=1, key_length=max_length)
-    # => the query_length dimension will then be broadcasted correctly
-    # This is more or less identical to T5's relative position bias:
-    # https://github.com/huggingface/transformers/blob/f681437203baa7671de3174b0fa583c349d9d5e1/src/transformers/models/t5/modeling_t5.py#L527
-    arange_tensor = ((attention_mask.cumsum(dim=-1) - 1) * attention_mask)[:, None, :]
-    alibi = slopes[..., None] * arange_tensor
-    if dist.is_initialized():
-        num_heads_per_rank = int(num_heads / dist.get_world_size())
-        offset = dist.get_rank() * num_heads_per_rank
-        alibi = alibi.view(batch_size, num_heads, 1, seq_length)
-        alibi = alibi[:, offset:num_heads_per_rank + offset, :, :]
-        return alibi.reshape(batch_size * num_heads_per_rank, 1, seq_length).to(dtype)
-    else:
-        return alibi.reshape(batch_size * num_heads, 1, seq_length).to(dtype)
 
 
 class InferenceEngine(Module):
@@ -101,6 +53,8 @@ class InferenceEngine(Module):
         DS_INFERENCE_ENABLED = True
 
         super().__init__()
+        if DeepSpeedTransformerInference.workspace is not None:
+            self.destroy()
 
         self.module = model
         self._config = config
@@ -114,6 +68,10 @@ class InferenceEngine(Module):
         if hasattr(self.module, "config"):
             TransformerPolicy.hf_model_config = self.module.config
 
+        if config.dtype not in get_accelerator().supported_dtypes():
+            raise ValueError(
+                f"Data type {config.dtype} is not supported by {get_accelerator().device_name()} accelerator")
+
         # todo: keep this self.injection_dict because we don't use to change config.injection_policy API
         # todo: this will get changed when Molly's PR on auto injection dict is merged
         self.injection_dict = config.injection_policy
@@ -122,7 +80,6 @@ class InferenceEngine(Module):
         self.mp_group = config.tensor_parallel.tp_group
         self.mpu = config.tensor_parallel.mpu
 
-        #self._validate_args(self.mpu, config.replace_with_kernel_inject)
         self.quantize_merge_count = 1
         self.quantization_scales = None
 
@@ -146,6 +103,7 @@ class InferenceEngine(Module):
             # This is a hack to redefine the alibi func due to TP
             if config.tensor_parallel.tp_size > 1:
                 self.build_alibi_tensor()
+                self.build_attn_bias()
 
         if get_accelerator().device_name() == 'cuda' and config.enable_cuda_graph:
             assert pkg_version.parse(torch.__version__) >= pkg_version.parse("1.10"), \
@@ -170,22 +128,32 @@ class InferenceEngine(Module):
         if moe and dist.get_world_size() > 1:
             self._create_ep_parallel_group(config.moe.moe_experts)
 
-        # We only support three modes: 1) user specified policy for tensor-parallelism, 2) kernel injection (replace_with_kernel_inject), and 3) automatic tensor parallelism.
+        # We only support three modes: 1) user specified policy for tensor-parallelism, 2) kernel injection (replace_with_kernel_inject), and 3) automatic tensor parallelism if tp_size > 1.
         if self.injection_dict:
             # 1. User specified Tensor Parallelism
             assert not config.replace_with_kernel_inject, "Cannot use both user specified injection policy and kernel injection"
             for client_module, injection_policy in self.injection_dict.items():
+
+                assert issubclass(client_module,
+                                  torch.nn.Module), f"{client_module} is not a subclass of torch.nn.Module"
+
                 # construct the tuple and pass that instead of a string or dict.
                 if isinstance(injection_policy, str):
                     config.injection_policy_tuple = (injection_policy, )
                 else:
                     config.injection_policy_tuple = injection_policy
+
+                layer_names = [name for name, _ in self.module.named_modules()]
+                for policy in config.injection_policy_tuple:
+                    if not any(name.endswith(policy) for name in layer_names):
+                        raise ValueError(f"Injection policy layer'{policy}' not valid.")
+
                 self._apply_injection_policy(config, client_module)
         else:
             if config.replace_with_kernel_inject:
                 # 2. DeepSpeed Kernel Injection
                 self._apply_injection_policy(config)
-            else:
+            elif config.tensor_parallel.tp_size > 1:
                 # 3. Automatic Tensor Parallelism
                 parser_dict = AutoTP.tp_parser(model)
                 print("AutoTP: ", parser_dict)
@@ -197,7 +165,12 @@ class InferenceEngine(Module):
                     self._apply_injection_policy(config, client_module)
 
         device = get_accelerator().current_device_name()
-        self.module.to(device)
+        # NOTE: This check assumes a Hugging Face hierarchy for the device type i.e. module.device.type
+        is_meta_device = hasattr(self.module, "device") and self.module.device.type == 'meta'
+        if is_meta_device:
+            self.module.to_empty(device=device)
+        else:
+            self.module.to(device)
 
         if config.tensor_parallel.tp_size > 1:
             _rng_state = get_accelerator().get_rng_state().to(get_accelerator().current_device_name())
@@ -209,6 +182,14 @@ class InferenceEngine(Module):
 
         # Check if local CUDA graphs can be created in replacement modules
         self.local_cuda_graph = self._local_cuda_graph_used(self.module)
+        self._is_compiled = False
+
+    def destroy(self):
+        DeepSpeedTransformerInference.layer_id = 0
+        DeepSpeedSelfAttention.num_layers = 0
+        if DeepSpeedTransformerInference.workspace.is_allocated():
+            DeepSpeedTransformerInference.workspace.release_workspace()
+        DeepSpeedTransformerInference.workspace = None
 
     def profile_model_time(self, use_cuda_events=True):
         if not self.model_profile_enabled and not self._config.enable_cuda_graph:
@@ -233,6 +214,19 @@ class InferenceEngine(Module):
         if hasattr(self.module, 'transformer'):
             if hasattr(self.module.transformer, 'build_alibi_tensor'):
                 self.module.transformer.build_alibi_tensor = build_bloom_alibi_tensor
+            if hasattr(self.module.transformer, 'build_mpt_alibi_tensor'):
+                self.module.transformer.build_mpt_alibi_tensor_orig = self.module.transformer.build_mpt_alibi_tensor
+                self.module.transformer.__class__.build_mpt_alibi_tensor = build_mpt_alibi_tensor
+        if hasattr(self.module, 'model'):
+            if hasattr(self.module.model, 'get_alibi_mask'):
+                self.module.model.get_alibi_mask_orig = self.module.model.get_alibi_mask
+                self.module.model.__class__.get_alibi_mask = get_alibi_mask
+
+    def build_attn_bias(self):
+        if hasattr(self.module, 'transformer'):
+            if hasattr(self.module.transformer, '_attn_bias'):
+                self.module.transformer._attn_bias_orig = self.module.transformer._attn_bias
+                self.module.transformer.__class__._attn_bias = build_mpt_atten_bias_tensor
 
     def _pre_forward_hook(self, module, *inputs, **kwargs):
         if self.use_cuda_events:
@@ -248,7 +242,7 @@ class InferenceEngine(Module):
         else:
             get_accelerator().synchronize()
             self._end = time.time()
-            elapsed_time = self._end - self._start
+            elapsed_time = (self._end - self._start) * 1e3  # convert seconds to ms
         self._model_times.append(elapsed_time)
 
     def _create_model_parallel_group(self, config):
@@ -304,29 +298,6 @@ class InferenceEngine(Module):
             f"quantize_bits = {self.quantize_bits} "
             f"mlp_extra_grouping = {self.mlp_extra_grouping}, "
             f"quantize_groups = {self.quantize_groups}", [0])
-
-    # TODO: remove this function and add this functionality to pydantic config checking
-    def _validate_args(self, mpu, replace_with_kernel_inject):
-        # TODO: to support SD pipeline we need to avoid this check for now
-        if replace_with_kernel_inject and not isinstance(self.module, Module):
-            raise ValueError(f"model must be a torch.nn.Module, got {type(self.module)}")
-        if not isinstance(self._config.tensor_parallel.tp_size, int) or self._config.tensor_parallel.tp_size < 1:
-            raise ValueError(f"mp_size must be an int >= 1, got {self._config.tensor_parallel.tp_size}")
-
-        if mpu:
-            methods = ["get_model_parallel_group", "get_data_parallel_group"]
-            for method in methods:
-                if not hasattr(mpu, method):
-                    raise ValueError(f"mpu is missing {method}")
-        if self._config.checkpoint is not None and not isinstance(self._config.checkpoint, (str, dict)):
-            raise ValueError(f"checkpoint must be None, str or dict, got {type(self._config.checkpoint)}")
-
-        supported_dtypes = [None, torch.half, torch.int8, torch.float]
-        if self._config.dtype not in supported_dtypes:
-            raise ValueError(f"{self._config.dtype} not supported, valid dtype: {supported_dtypes}")
-
-        if self.injection_dict is not None and not isinstance(self.injection_dict, dict):
-            raise ValueError(f"injection_dict must be None or a dict, got: {self.injection_dict}")
 
     def load_model_with_checkpoint(self, r_module):
         self.mp_replace = ReplaceWithTensorSlicing(
@@ -411,9 +382,7 @@ class InferenceEngine(Module):
         checkpoint = SDLoaderFactory.get_sd_loader_json(checkpoint_dir,
                                                         self.checkpoint_engine) if checkpoint_dir is not None else None
 
-        generic_injection(self.module,
-                          fp16=(config.dtype == torch.half) or (config.dtype == torch.int8),
-                          enable_cuda_graph=config.enable_cuda_graph)
+        generic_injection(self.module, dtype=config.dtype, enable_cuda_graph=config.enable_cuda_graph)
 
         if isinstance(self.module, torch.nn.Module):
             # config is our DeepSpeedInferenceConfig and self.config is the HF model config
@@ -459,7 +428,7 @@ class InferenceEngine(Module):
         checkpoint = sd_loader['checkpoints']
 
         if type(checkpoint) is list:
-            self.sd = torch.load(checkpoint[0], map_location='cpu')
+            self.sd = torch.load(checkpoint[0], map_location='cpu', weights_only=False)
             self.key_list = list(self.sd.keys())
 
             self.load_model_with_checkpoint(self.module)
@@ -467,7 +436,7 @@ class InferenceEngine(Module):
             for i in range(1, len(checkpoint)):
                 if not dist.is_initialized() or dist.get_rank() == 0:
                     print(f"loading checkpoint ({i})")
-                self.sd = torch.load(checkpoint[i], map_location=get_accelerator().device_name())
+                self.sd = torch.load(checkpoint[i], map_location=get_accelerator().device_name(), weights_only=False)
                 self.key_list = list(self.sd.keys())
                 self.load_model_with_checkpoint(self.module)
         else:
@@ -533,11 +502,11 @@ class InferenceEngine(Module):
         get_accelerator().current_stream().wait_stream(cuda_stream)
 
         # create cuda_graph and assign static_inputs and static_outputs
-        self._cuda_graphs = torch.cuda.CUDAGraph()
+        self._cuda_graphs = get_accelerator().create_graph()
         self.static_inputs = inputs
         self.static_kwargs = kwargs
 
-        with torch.cuda.graph(self._cuda_graphs):
+        with get_accelerator().capture_to_graph(self._cuda_graphs):
             self.static_output = self.module(*self.static_inputs, **self.static_kwargs)
 
         self.cuda_graph_created = True
@@ -549,7 +518,7 @@ class InferenceEngine(Module):
         for k in kwargs:
             if torch.is_tensor(kwargs[k]):
                 self.static_kwargs[k].copy_(kwargs[k])
-        self._cuda_graphs.replay()
+        get_accelerator().replay_graph(self._cuda_graphs)
         return self.static_output
 
     def model_times(self):
@@ -601,12 +570,13 @@ class InferenceEngine(Module):
             else:
                 self._create_cuda_graph(*inputs, **kwargs)
                 outputs = self._graph_replay(*inputs, **kwargs)
+
         else:
             outputs = self.module(*inputs, **kwargs)
 
         if self.model_profile_enabled and self._config.enable_cuda_graph:
             get_accelerator().synchronize()
-            duration = time.time() - start
+            duration = (time.time() - start) * 1e3  # convert seconds to ms
             self._model_times.append(duration)
 
         return outputs
@@ -626,4 +596,31 @@ class InferenceEngine(Module):
             raise NotImplementedError("DeepSpeed does not support `num_beams` > 1, if this is important to you please "
                                       "add your request to: https://github.com/microsoft/DeepSpeed/issues/2506")
 
+        if ("input_ids" in kwargs) and (kwargs["input_ids"].dim() == 2):
+            for input_tensor in kwargs["input_ids"]:
+                tensor_length = input_tensor.shape[-1]
+                if tensor_length > self._config.max_out_tokens:
+                    raise RuntimeError(
+                        f"Input with size {tensor_length} exceeds maximum length of {self._config.max_out_tokens}. Please increase `max_tokens` in the DeepSpeed Inference Config."
+                    )
+
         return self.module.generate(*inputs, **kwargs)
+
+    def compile(self, backend=get_accelerator().get_compile_backend(), compile_kwargs={}) -> None:
+        """
+        Compile the module using the specified backend and kwargs.
+        """
+        if not is_compile_supported():
+            raise RuntimeError("compile is not supported in your version of PyTorch.")
+
+        if self._is_compiled:
+            return
+
+        # Avoid graph breaks
+        deepspeed.utils.nvtx.enable_nvtx = False
+        self.module.compile(backend=backend, **compile_kwargs)
+        self._is_compiled = True
+
+    @property
+    def is_compiled(self) -> bool:
+        return self._is_compiled

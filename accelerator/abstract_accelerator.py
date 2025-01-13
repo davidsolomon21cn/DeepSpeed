@@ -12,6 +12,23 @@ class DeepSpeedAccelerator(ABC):
     def __init__(self):
         self._name = None
         self._communication_backend_name = None
+        self._compile_backend = None
+
+    @abc.abstractmethod
+    def is_synchronized_device(self):
+        ...
+
+    @abc.abstractmethod
+    def use_host_timers(self):
+        ...
+
+    @abc.abstractmethod
+    def resolves_data_dependency(self):
+        ...
+
+    @abc.abstractmethod
+    def handles_memory_backpressure(self):
+        ...
 
     # Device APIs
     @abc.abstractmethod
@@ -64,7 +81,7 @@ class DeepSpeedAccelerator(ABC):
         ...
 
     @abc.abstractmethod
-    def initial_seed(self, seed):
+    def initial_seed(self):
         ...
 
     @abc.abstractmethod
@@ -143,6 +160,10 @@ class DeepSpeedAccelerator(ABC):
     def total_memory(self, device_index=None):
         ...
 
+    @abc.abstractmethod
+    def available_memory(self, device_index=None):
+        ...
+
     # Data types
     @abc.abstractmethod
     def is_bf16_supported(self):
@@ -150,6 +171,10 @@ class DeepSpeedAccelerator(ABC):
 
     @abc.abstractmethod
     def is_fp16_supported(self):
+        ...
+
+    @abc.abstractmethod
+    def supported_dtypes(self):
         ...
 
     # Misc
@@ -175,6 +200,23 @@ class DeepSpeedAccelerator(ABC):
 
     @abc.abstractmethod
     def communication_backend_name(self):
+        ...
+
+    @abc.abstractmethod
+    def is_triton_supported(self):
+        ...
+
+    # Graph operations
+    @abc.abstractmethod
+    def create_graph(self):
+        ...
+
+    @abc.abstractmethod
+    def capture_to_graph(self, graph, pool=None, stream=None):
+        ...
+
+    @abc.abstractmethod
+    def replay_graph(self, graph):
         ...
 
     # Tensor operations
@@ -214,7 +256,11 @@ class DeepSpeedAccelerator(ABC):
         ...
 
     @abc.abstractmethod
-    def pin_memory(self, tensor):
+    def pin_memory(self, tensor, align_bytes=1):
+        ...
+
+    @abc.abstractmethod
+    def is_pinned(self, tensor):
         ...
 
     @abc.abstractmethod
@@ -237,4 +283,24 @@ class DeepSpeedAccelerator(ABC):
 
     @abc.abstractmethod
     def build_extension(self):
+        ...
+
+    @abc.abstractmethod
+    def export_envs(self):
+        ...
+
+    @abc.abstractmethod
+    def visible_devices_envs(self):
+        ...
+
+    @abc.abstractmethod
+    def set_visible_devices_envs(self, current_env, local_accelerator_ids):
+        ...
+
+    @abc.abstractmethod
+    def get_compile_backend(self):
+        ...
+
+    @abc.abstractmethod
+    def set_compile_backend(self, backend):
         ...

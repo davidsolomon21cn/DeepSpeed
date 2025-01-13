@@ -163,7 +163,9 @@ at::Tensor einsum_sec_sm_ecm(at::Tensor& Q, at::Tensor& W)
                    (T*)W.data_ptr(),
                    (T*)Q.data_ptr(),
                    (T*)O.data_ptr(),
-#ifdef __HIP_PLATFORM_HCC__
+// TODO HIP: Remove backward compatibility for torch<=2.0 in future
+#if defined(__HIP_PLATFORM_AMD__) && \
+    ((TORCH_VERSION_MAJOR < 2) || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR == 0))
                    rocblas_gemm_algo_standard);
 #else
                    CUBLAS_GEMM_DEFAULT_TENSOR_OP);
@@ -216,7 +218,8 @@ void attention_unfused(at::Tensor& prev_key_cont,
                                 seq_len * k,
                                 seq_len * soft_len,
                                 bsz * heads,
-#ifdef __HIP_PLATFORM_HCC__
+#if defined(__HIP_PLATFORM_AMD__) && \
+    ((TORCH_VERSION_MAJOR < 2) || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR == 0))
                                 rocblas_gemm_algo_standard);
 #else
                                 CUBLAS_GEMM_DEFAULT_TENSOR_OP);
@@ -253,7 +256,8 @@ void attention_unfused(at::Tensor& prev_key_cont,
                                 seq_len * soft_len,
                                 seq_len * k,
                                 bsz * heads,
-#ifdef __HIP_PLATFORM_HCC__
+#if defined(__HIP_PLATFORM_AMD__) && \
+    ((TORCH_VERSION_MAJOR < 2) || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR == 0))
                                 rocblas_gemm_algo_standard);
 #else
                                 CUBLAS_GEMM_DEFAULT_TENSOR_OP);
@@ -388,7 +392,8 @@ void attention_unfused(T* prev_key_cont,
                                 seq_len * k,
                                 seq_len * soft_len,
                                 bsz * heads,
-#ifdef __HIP_PLATFORM_HCC__
+#if defined(__HIP_PLATFORM_AMD__) && \
+    ((TORCH_VERSION_MAJOR < 2) || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR == 0))
                                 rocblas_gemm_algo_standard);
 #else
                                 CUBLAS_GEMM_DEFAULT_TENSOR_OP);
@@ -421,7 +426,8 @@ void attention_unfused(T* prev_key_cont,
                                 seq_len * soft_len,
                                 seq_len * k,
                                 bsz * heads,
-#ifdef __HIP_PLATFORM_HCC__
+#if defined(__HIP_PLATFORM_AMD__) && \
+    ((TORCH_VERSION_MAJOR < 2) || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR == 0))
                                 rocblas_gemm_algo_standard);
 #else
                                 CUBLAS_GEMM_DEFAULT_TENSOR_OP);
@@ -437,6 +443,7 @@ std::vector<at::Tensor> ds_softmax_context(at::Tensor& query_key_value,
                                            bool rotate_half,
                                            bool rotate_every_two,
                                            int heads,
+                                           int num_kv,
                                            float norm_factor,
                                            bool triangular,
                                            bool local_attention,
@@ -444,18 +451,22 @@ std::vector<at::Tensor> ds_softmax_context(at::Tensor& query_key_value,
                                            bool no_masking,
                                            unsigned layer_id,
                                            unsigned num_layers,
-                                           at::Tensor& alibi)
+                                           at::Tensor& alibi,
+                                           float rope_theta,
+                                           bool is_prompt,
+                                           std::optional<at::Tensor> token_idx,
+                                           std::optional<at::Tensor> position_ids)
 {
     unsigned bsz = query_key_value.size(0);
     unsigned seq_len = query_key_value.size(1);
-    unsigned hidden_dim = query_key_value.size(2) / 3;
+    int k = query_key_value.size(2) / (heads + 2 * (num_kv > 0 ? num_kv : heads));
+    unsigned hidden_dim = heads * k;
 
-    bool is_prompt = (seq_len > 1);
+    is_prompt = (seq_len > 1);
 
     if (is_prompt) InferenceContext::Instance().reset_tokens(seq_len);
     unsigned soft_len = InferenceContext::Instance().current_tokens();
 
-    int k = hidden_dim / heads;
     auto options = at::TensorOptions()
                        .dtype(query_key_value.options().dtype())
                        .layout(at::kStrided)
@@ -486,12 +497,14 @@ std::vector<at::Tensor> ds_softmax_context(at::Tensor& query_key_value,
                                       soft_len,
                                       hidden_dim,
                                       heads,
+                                      (num_kv > 0 ? num_kv : heads),
                                       rotary_dim,
                                       rotate_half,
                                       rotate_every_two,
                                       InferenceContext::Instance().GetCurrentStream(),
                                       3,
-                                      InferenceContext::Instance().GetMaxTokenLength());
+                                      InferenceContext::Instance().GetMaxTokenLength(),
+                                      rope_theta);
     if (rotary_dim > 0 && rotate_half)
         launch_apply_rotary_pos_emb(query_cont,
                                     kv_cache,
@@ -501,6 +514,7 @@ std::vector<at::Tensor> ds_softmax_context(at::Tensor& query_key_value,
                                     (is_prompt ? 0 : soft_len - 1),
                                     heads,
                                     bsz,
+                                    rope_theta,
                                     InferenceContext::Instance().GetCurrentStream(),
                                     InferenceContext::Instance().GetMaxTokenLength());
 
@@ -531,22 +545,23 @@ std::vector<at::Tensor> ds_softmax_context(at::Tensor& query_key_value,
                                1);
 
     if (layer_id == num_layers - 1) InferenceContext::Instance().advance_tokens();
-    auto prev_key = torch::from_blob(workspace + offset,
-                                     {bsz, heads, all_tokens, k},
-                                     {hidden_dim * InferenceContext::Instance().GetMaxTokenLength(),
-                                      k * InferenceContext::Instance().GetMaxTokenLength(),
-                                      k,
-                                      1},
-                                     options);
+    auto prev_key = torch::from_blob(
+        workspace + offset,
+        {bsz, heads, all_tokens, k},
+        {hidden_dim * static_cast<int64_t>(InferenceContext::Instance().GetMaxTokenLength()),
+         k * static_cast<int64_t>(InferenceContext::Instance().GetMaxTokenLength()),
+         k,
+         1},
+        options);
 
-    auto prev_value =
-        torch::from_blob(workspace + offset + value_offset,
-                         {bsz, heads, all_tokens, k},
-                         {hidden_dim * InferenceContext::Instance().GetMaxTokenLength(),
-                          k * InferenceContext::Instance().GetMaxTokenLength(),
-                          k,
-                          1},
-                         options);
+    auto prev_value = torch::from_blob(
+        workspace + offset + value_offset,
+        {bsz, heads, all_tokens, k},
+        {hidden_dim * static_cast<int64_t>(InferenceContext::Instance().GetMaxTokenLength()),
+         k * static_cast<int64_t>(InferenceContext::Instance().GetMaxTokenLength()),
+         k,
+         1},
+        options);
 
     return {output, prev_key, prev_value};
 }
@@ -881,7 +896,8 @@ void quantized_gemm(void* output,
                    weight16,
                    (T*)input,
                    (T*)output,
-#ifdef __HIP_PLATFORM_HCC__
+#if defined(__HIP_PLATFORM_AMD__) && \
+    ((TORCH_VERSION_MAJOR < 2) || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR == 0))
                    rocblas_gemm_algo_standard);
 #else
                    CUBLAS_GEMM_DEFAULT_TENSOR_OP);
@@ -926,7 +942,8 @@ at::Tensor qkv_unfused_cublas(at::Tensor& output,
                        (T*)weight.data_ptr(),
                        workspace,
                        (T*)output.data_ptr(),
-#ifdef __HIP_PLATFORM_HCC__
+#if defined(__HIP_PLATFORM_AMD__) && \
+    ((TORCH_VERSION_MAJOR < 2) || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR == 0))
                        rocblas_gemm_algo_standard);
 #else
                        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
@@ -998,7 +1015,8 @@ std::vector<at::Tensor> ds_rms_qkv(at::Tensor& input,
                        (T*)weight.data_ptr(),
                        (T*)rms_norm.data_ptr(),
                        (T*)output.data_ptr(),
-#ifdef __HIP_PLATFORM_HCC__
+#if defined(__HIP_PLATFORM_AMD__) && \
+    ((TORCH_VERSION_MAJOR < 2) || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR == 0))
                        rocblas_gemm_algo_standard);
 #else
                        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
@@ -1084,7 +1102,8 @@ void quantized_gemm(at::Tensor& output,
                    (T*)weight16.data_ptr(),
                    (T*)input.data_ptr(),
                    (T*)output.data_ptr(),
-#ifdef __HIP_PLATFORM_HCC__
+#if defined(__HIP_PLATFORM_AMD__) && \
+    ((TORCH_VERSION_MAJOR < 2) || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR == 0))
                    rocblas_gemm_algo_standard);
 #else
                    CUBLAS_GEMM_DEFAULT_TENSOR_OP);
@@ -1098,7 +1117,8 @@ at::Tensor ds_linear_layer(at::Tensor& input,
                            bool add_bias,
                            bool do_flash_attn,
                            int num_heads,
-                           bool transposed_mode)
+                           bool transposed_mode,
+                           float rope_theta)
 {
     auto input_cont = input.contiguous();
     auto options = at::TensorOptions()
@@ -1109,8 +1129,9 @@ at::Tensor ds_linear_layer(at::Tensor& input,
 
     int head_size = input_cont.size(2) / num_heads;
     int bsz = input.size(0) * input.size(1);
+    int out_size = transposed_mode ? weight.size(0) : weight.size(1);
     T* workspace = (T*)InferenceContext::Instance().GetWorkSpace();
-    auto output = at::from_blob(workspace, {input.size(0), input.size(1), weight.size(1)}, options);
+    auto output = at::from_blob(workspace, {input.size(0), input.size(1), out_size}, options);
 
     float alpha = (T)1.0;
     float gemm_beta = (T)0.0;
@@ -1128,7 +1149,8 @@ at::Tensor ds_linear_layer(at::Tensor& input,
                    (T*)weight.data_ptr(),
                    (T*)input_cont.data_ptr(),
                    (T*)output.data_ptr(),
-#ifdef __HIP_PLATFORM_HCC__
+#if defined(__HIP_PLATFORM_AMD__) && \
+    ((TORCH_VERSION_MAJOR < 2) || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR == 0))
                    rocblas_gemm_algo_standard);
 #else
                    CUBLAS_GEMM_DEFAULT_TENSOR_OP);
@@ -1166,11 +1188,13 @@ at::Tensor ds_linear_layer(at::Tensor& input,
                 (num_heads * padded_head_size),
                 num_heads,
                 -1,
+                -1,
                 false,
                 false,
                 InferenceContext::Instance().GetCurrentStream(),
                 3,
-                input.size(1));
+                input.size(1),
+                rope_theta);
             return at::from_blob(final_output,
                                  {3, input.size(0), num_heads, input.size(1), padded_head_size},
                                  options);
@@ -1191,11 +1215,13 @@ at::Tensor ds_linear_layer(at::Tensor& input,
                 input_cont.size(2),
                 num_heads,
                 -1,
+                -1,
                 false,
                 false,
                 InferenceContext::Instance().GetCurrentStream(),
                 3,
-                input.size(1));
+                input.size(1),
+                rope_theta);
             return at::from_blob(
                 final_output, {3, input.size(0), num_heads, input.size(1), head_size}, options);
             // return at::from_blob(workspace, {input.size(0) * input.size(1), 3, num_heads,
@@ -1313,7 +1339,7 @@ at::Tensor ds_vector_matmul(at::Tensor& input,
                        .layout(at::kStrided)
                        .device(at::kCUDA)
                        .requires_grad(false);
-    int out_size = q_int8 ? weight.size(0) : weight.size(1);
+    int out_size = (q_int8 || transposed_mode) ? weight.size(0) : weight.size(1);
     int bsz = input.size(0) * input.size(1);
 
     T* workspace = (T*)InferenceContext::Instance().GetWorkSpace();
@@ -1342,7 +1368,8 @@ at::Tensor ds_vector_matmul(at::Tensor& input,
                        (T*)weight.data_ptr(),
                        (T*)input.data_ptr(),
                        (T*)output.data_ptr(),
-#ifdef __HIP_PLATFORM_HCC__
+#if defined(__HIP_PLATFORM_AMD__) && \
+    ((TORCH_VERSION_MAJOR < 2) || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR == 0))
                        rocblas_gemm_algo_standard);
 #else
                        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
@@ -1428,7 +1455,8 @@ at::Tensor mlp_unfused_cublas(at::Tensor& output,
                        (T*)weight.data_ptr(),
                        inp_norm,
                        intermediate,
-#ifdef __HIP_PLATFORM_HCC__
+#if defined(__HIP_PLATFORM_AMD__) && \
+    ((TORCH_VERSION_MAJOR < 2) || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR == 0))
                        rocblas_gemm_algo_standard);
 #else
                        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
@@ -1472,7 +1500,8 @@ at::Tensor mlp_unfused_cublas(at::Tensor& output,
                        (T*)weight1.data_ptr(),
                        intermediate,
                        (T*)output.data_ptr(),
-#ifdef __HIP_PLATFORM_HCC__
+#if defined(__HIP_PLATFORM_AMD__) && \
+    ((TORCH_VERSION_MAJOR < 2) || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR == 0))
                        rocblas_gemm_algo_standard);
 #else
                        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
@@ -1567,7 +1596,9 @@ std::vector<at::Tensor> ds_rms_mlp_gemm(at::Tensor& input,
     auto output = at::from_blob(output_ptr, input.sizes(), options);
     auto inp_norm = at::from_blob(inp_norm_ptr, input.sizes(), options);
     auto intermediate_gemm =
-        at::from_blob(intermediate_ptr, {input.size(0), input.size(1), mlp_1_out_neurons}, options);
+        at::from_blob(intermediate_ptr,
+                      {input.size(0), input.size(1), static_cast<int64_t>(mlp_1_out_neurons)},
+                      options);
 
     auto act_func_type = static_cast<ActivationFuncType>(activation_type);
 
@@ -1606,7 +1637,8 @@ std::vector<at::Tensor> ds_rms_mlp_gemm(at::Tensor& input,
                        (T*)weight_interm.data_ptr(),
                        (T*)inp_norm.data_ptr(),
                        intermediate_ptr,
-#ifdef __HIP_PLATFORM_HCC__
+#if defined(__HIP_PLATFORM_AMD__) && \
+    ((TORCH_VERSION_MAJOR < 2) || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR == 0))
                        rocblas_gemm_algo_standard);
 #else
                        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
@@ -1669,7 +1701,8 @@ std::vector<at::Tensor> ds_rms_mlp_gemm(at::Tensor& input,
                        (T*)weight_out.data_ptr(),
                        intermediate_ptr,
                        (T*)output.data_ptr(),
-#ifdef __HIP_PLATFORM_HCC__
+#if defined(__HIP_PLATFORM_AMD__) && \
+    ((TORCH_VERSION_MAJOR < 2) || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR == 0))
                        rocblas_gemm_algo_standard,
 #else
                        CUBLAS_GEMM_DEFAULT_TENSOR_OP,
@@ -1731,7 +1764,8 @@ at::Tensor fused_gemm_gelu(at::Tensor& input,
                        (T*)weight.data_ptr(),
                        (T*)input.data_ptr(),
                        (T*)intermediate.data_ptr(),
-#ifdef __HIP_PLATFORM_HCC__
+#if defined(__HIP_PLATFORM_AMD__) && \
+    ((TORCH_VERSION_MAJOR < 2) || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR == 0))
                        rocblas_gemm_algo_standard);
 #else
                        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
@@ -1765,7 +1799,8 @@ at::Tensor fused_gemm_gelu(at::Tensor& input,
                        (T*)weight_out.data_ptr(),
                        (T*)intermediate.data_ptr(),
                        (T*)output.data_ptr(),
-#ifdef __HIP_PLATFORM_HCC__
+#if defined(__HIP_PLATFORM_AMD__) && \
+    ((TORCH_VERSION_MAJOR < 2) || (TORCH_VERSION_MAJOR == 2 && TORCH_VERSION_MINOR == 0))
                        rocblas_gemm_algo_standard);
 #else
                        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
@@ -1842,7 +1877,8 @@ std::vector<at::Tensor> apply_rotary_pos_emb(at::Tensor& mixed_query,
                                              unsigned rotary_dim,
                                              unsigned offset,
                                              unsigned num_heads,
-                                             bool rotate_half)
+                                             bool rotate_half,
+                                             float rope_theta)
 {
     auto query_cont = mixed_query.contiguous();
     auto key_cont = key_layer.contiguous();
@@ -1860,6 +1896,7 @@ std::vector<at::Tensor> apply_rotary_pos_emb(at::Tensor& mixed_query,
                                            offset,
                                            num_heads,
                                            bsz,
+                                           rope_theta,
                                            InferenceContext::Instance().GetCurrentStream(),
                                            InferenceContext::Instance().GetMaxTokenLength());
     else
@@ -1871,6 +1908,7 @@ std::vector<at::Tensor> apply_rotary_pos_emb(at::Tensor& mixed_query,
                                             offset,
                                             num_heads,
                                             bsz,
+                                            rope_theta,
                                             InferenceContext::Instance().GetCurrentStream(),
                                             InferenceContext::Instance().GetMaxTokenLength());
     return {query_cont, key_cont};
@@ -1905,6 +1943,27 @@ void ds_release_workspace() { InferenceContext::Instance().release_workspace(); 
 
 bool ds_retake_workspace() { return InferenceContext::Instance().retake_workspace(); }
 
+template <typename T>
+at::Tensor ds_dequantize(at::Tensor& weight, at::Tensor& qscale, int groups)
+{
+    auto options = at::TensorOptions()
+                       .dtype(torch::kFloat16)
+                       .layout(at::kStrided)
+                       .device(at::kCUDA)
+                       .requires_grad(false);
+    auto weight16 = at::empty({weight.size(0), weight.size(1)}, options);
+
+    launch_dequantize((T*)weight16.data_ptr(),
+                      (int8_t*)weight.data_ptr(),
+                      (float*)qscale.data_ptr(),
+                      weight.size(0),
+                      weight.size(1),
+                      groups,
+                      InferenceContext::Instance().GetCurrentStream());
+
+    return weight16;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
     m.def("softmax_context_int8",
@@ -1934,7 +1993,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("softmax_" #_name, &ds_softmax<_dtype>, "DeepSpeed SoftMax with " #_name " (CUDA)");    \
     m.def("softmax_context_" #_name,                                                              \
           &ds_softmax_context<_dtype>,                                                            \
-          "DeepSpeed attention with _name (CUDA)");                                               \
+          "DeepSpeed attention with " #_name " (CUDA)");                                          \
     m.def("bias_gelu_" #_name, &ds_bias_gelu<_dtype>, "DeepSpeed Gelu with " #_name " (CUDA)");   \
     m.def("bias_add_" #_name, &ds_bias_add<_dtype>, "DeepSpeed Bias Add with " #_name " (CUDA)"); \
     m.def("bias_relu_" #_name, &ds_bias_relu<_dtype>, "DeepSpeed ReLU with " #_name " (CUDA)");   \
@@ -1972,7 +2031,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           "DeepSpeed residual add with " #_name " (CUDA)");                                       \
     m.def("allocate_workspace_" #_name,                                                           \
           &allocate_workspace<_dtype>,                                                            \
-          "DeepSpeed memory allocation for GPT inference with " #_name " (CUDA)")
+          "DeepSpeed memory allocation for GPT inference with " #_name " (CUDA)");                \
+    m.def("dequantize_" #_name,                                                                   \
+          &ds_dequantize<_dtype>,                                                                 \
+          "DeepSpeed dequantize with " #_name " (CUDA)");
 
     DEF_OPS(fp32, float);
     DEF_OPS(fp16, __half);

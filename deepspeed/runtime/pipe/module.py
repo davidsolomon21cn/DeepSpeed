@@ -20,6 +20,7 @@ from ..activation_checkpointing import checkpointing
 from .topology import PipeDataParallelTopology, PipelineParallelGrid
 from deepspeed.runtime.state_dict_factory import SDLoaderFactory
 from deepspeed.accelerator import get_accelerator
+from deepspeed.checkpoint.utils import clone_tensors_for_torch_save
 
 
 class PipelineError(Exception):
@@ -75,11 +76,11 @@ class LayerSpec:
 
 class TiedLayerSpec(LayerSpec):
 
-    def __init__(self, key, typename, *module_args, forward_fn=None, tied_weight_attr='weight', **module_kwargs):
+    def __init__(self, key, typename, *module_args, forward_fn=None, tied_weight_attr=['weight'], **module_kwargs):
         super().__init__(typename, *module_args, **module_kwargs)
         self.key = key
         self.forward_fn = forward_fn
-        self.tied_weight_attr = tied_weight_attr
+        self.tied_weight_attr = [tied_weight_attr] if type(tied_weight_attr) == str else tied_weight_attr
 
 
 class PipelineModule(nn.Module):
@@ -115,7 +116,10 @@ class PipelineModule(nn.Module):
         partition_method (str, optional): The method upon which the layers are partitioned. Defaults to 'parameters'.
         activation_checkpoint_interval (int, optional): The granularity activation checkpointing in terms of number of layers. 0 disables activation checkpointing.
         activation_checkpoint_func (callable, optional): The function to use for activation checkpointing. Defaults to ``deepspeed.checkpointing.checkpoint``.
-        checkpointable_layers(list, optional): Checkpointable layers may not be checkpointed. Defaults to None which does not additional filtering.
+        checkpointable_layers (list[str], optional): List of layer class names that are eligible for checkpointing. For GPT models,
+            ParallelTransformerLayerPipe is always checkpointed regardless of this list. If None, all layers with parameters are
+            considered checkpointable. Defaults to None.
+        dynamic_shape: Allows dynamic shapes of inputs. This might have a performance impact.
     """
 
     def __init__(self,
@@ -129,7 +133,8 @@ class PipelineModule(nn.Module):
                  partition_method='parameters',
                  activation_checkpoint_interval=0,
                  activation_checkpoint_func=checkpointing.checkpoint,
-                 checkpointable_layers=None):
+                 checkpointable_layers=None,
+                 dynamic_shape=False):
 
         super().__init__()
 
@@ -159,7 +164,7 @@ class PipelineModule(nn.Module):
         self.global_rank = dist.get_rank(group=self.world_group)
         self.world_size = dist.get_world_size(group=self.world_group)
         self.local_rank = int(os.environ.get("LOCAL_RANK", None))
-        assert self.local_rank != None
+        assert self.local_rank is not None
 
         if topology:
             self._topo = topology
@@ -195,6 +200,16 @@ class PipelineModule(nn.Module):
         #newseed = get_accelerator().initial_seed() + self._grid.get_stage_id()
         #ds_utils.set_random_seed(newseed)
 
+        self.activation_checkpoint_interval = activation_checkpoint_interval
+
+        self.activation_checkpoint_func = activation_checkpoint_func
+
+        #storage for precomputed checkpointeble results
+        self.is_checkpointable_results = []
+        self.is_checkpointable_results_interval = None
+
+        # if configuration use_reentrant = False, self.activation_checkpoint_func will be set to ``checkpointing.non_reentrant_checkpoint``
+
         #with torch.random.fork_rng(devices=[get_accelerator().current_device_name()]):
         self._build()
         self.to(get_accelerator().device_name(self.local_rank))
@@ -202,8 +217,17 @@ class PipelineModule(nn.Module):
         self.tied_comms = self._index_tied_modules()
         self._synchronize_tied_weights()
 
-        self.activation_checkpoint_interval = activation_checkpoint_interval
-        self.activation_checkpoint_func = activation_checkpoint_func
+        self.dynamic_shape = dynamic_shape
+
+    def _precompute_checkpointable_values(self):
+        if self.activation_checkpoint_interval > 0 and self.is_checkpointable_results_interval != self.activation_checkpoint_interval:
+            num_layers = len(self.forward_funcs)
+            self.interval_was_zero = False
+            for start_idx in range(0, num_layers, self.activation_checkpoint_interval):
+                end_idx = min(start_idx + self.activation_checkpoint_interval, num_layers)
+                funcs = self.forward_funcs[start_idx:end_idx]
+                self.is_checkpointable_results.append(self._is_checkpointable(funcs))
+            self.is_checkpointable_results_interval = self.activation_checkpoint_interval
 
     def _build(self):
         specs = self._layer_specs
@@ -258,6 +282,20 @@ class PipelineModule(nn.Module):
         # of our FP16 optimizer
         for p in self.parameters():
             p.ds_pipe_replicated = False
+
+    def _get_frozen_parameter_names(self, layer):
+        """ Get names of frozen parameters in the layer.
+
+            Returns:
+                A list of frozen parameter names
+        """
+        if isinstance(layer, LayerSpec):
+            l = layer.build()
+            return [n for n, p in l.named_parameters() if not p.requires_grad]
+        elif isinstance(layer, nn.Module):
+            return [n for n, p in layer.named_parameters() if not p.requires_grad]
+
+        return []
 
     def _count_layer_params(self):
         """Count the trainable parameters in individual layers.
@@ -335,7 +373,9 @@ class PipelineModule(nn.Module):
         else:
             num_layers = len(self.forward_funcs)
             x = forward_input
-            for start_idx in range(0, num_layers, self.activation_checkpoint_interval):
+            for start_idx, is_checkpointable_result in \
+                zip(range(0, num_layers, self.activation_checkpoint_interval), self.is_checkpointable_results):
+
                 end_idx = min(start_idx + self.activation_checkpoint_interval, num_layers)
 
                 funcs = self.forward_funcs[start_idx:end_idx]
@@ -344,7 +384,7 @@ class PipelineModule(nn.Module):
                 if not isinstance(x, tuple):
                     x = (x, )
 
-                if self._is_checkpointable(funcs):
+                if is_checkpointable_result:
                     x = self.activation_checkpoint_func(exec_range_func(start_idx, end_idx), *x)
                 else:
                     x = exec_range_func(start_idx, end_idx)(*x)
@@ -406,23 +446,26 @@ class PipelineModule(nn.Module):
     def allreduce_tied_weight_gradients(self):
         '''All reduce the gradients of the tied weights between tied stages'''
         for key, comm in self.tied_comms.items():
-            weight = getattr(self.tied_modules[key], comm['weight_attr'])
-            dist.all_reduce(weight.grad, group=comm['group'])
+            for attr_name in comm['weight_attr']:
+                weight = getattr(self.tied_modules[key], attr_name)
+                dist.all_reduce(weight.grad, group=comm['group'])
 
     def get_tied_weights_and_groups(self):
         weight_group_list = []
         for key, comm in self.tied_comms.items():
-            weight = getattr(self.tied_modules[key], comm['weight_attr'])
-            weight_group_list.append((weight, comm['group']))
+            for attr_name in comm['weight_attr']:
+                weight = getattr(self.tied_modules[key], attr_name)
+                weight_group_list.append((weight, comm['group']))
         return weight_group_list
 
     def _synchronize_tied_weights(self):
         for key, comm in self.tied_comms.items():
-            dist.broadcast(
-                getattr(comm['module'], comm['weight_attr']),
-                src=min(comm['ranks']),
-                group=comm['group'],
-            )
+            for attr_name in comm['weight_attr']:
+                dist.broadcast(
+                    getattr(comm['module'], attr_name),
+                    src=min(comm['ranks']),
+                    group=comm['group'],
+                )
 
     def _index_tied_modules(self):
         ''' Build communication structures for tied modules. '''
@@ -544,7 +587,7 @@ class PipelineModule(nn.Module):
         ckpt_files.sort()
         return ckpt_files
 
-    def save_state_dict(self, save_dir, checkpoint_engine):
+    def save_state_dict(self, save_dir, checkpoint_engine, exclude_frozen_params=False):
         # Processes having the same model parallel rank on different data parallel instances
         # have identical layer weights.  We can distribute the task of saving the layer weights
         # among the data parallel ranks.  For example, if a pipeline stage has 9 layers and
@@ -569,14 +612,12 @@ class PipelineModule(nn.Module):
             model_ckpt_path = self.ckpt_layer_path(save_dir, start + idx)
             if not hasattr(layer, 'state_dict'):
                 continue
-            # We pass cloned tensors to torch.save() to avoid checkpoint bloat which occurs because torch.save()
-            # saves the underlying storage rather than the slice of the storage corresponding to individual tensors.
-            # This is a problem in DeepSpeed because we often allocate tensors using slices of large flattened buffers.
-            # Tensor cloning helps to avoid this problem because the storage of cloned tensors are closer to the true size.
-            # It is expected that the garbage collector will reclaim the cloned tensor storage to avoid memory bloat.
-            # See https://pytorch.org/docs/stable/notes/serialization.html#preserve-storage-sharing
+
             orig_state_dict = layer.state_dict()
-            final_state_dict = type(orig_state_dict)({k: v.clone() for k, v in orig_state_dict.items()})
+            if exclude_frozen_params:
+                for n in self._get_frozen_parameter_names(layer):
+                    del orig_state_dict[n]
+            final_state_dict = clone_tensors_for_torch_save(orig_state_dict)
             checkpoint_engine.save(final_state_dict, model_ckpt_path)
 
     def load_state_dir(self, load_dir, checkpoint_engine, strict=True):
@@ -595,7 +636,7 @@ class PipelineModule(nn.Module):
                                                       checkpoint_engine=checkpoint_engine)
             load_path, checkpoint, _ = sd_loader.load(mp_world_size, mp_rank, module_key=None, is_pipe_parallel=True)
 
-            layer.load_state_dict(checkpoint)
+            layer.load_state_dict(checkpoint, strict=strict)
 
             # if self._grid.data_parallel_id == 0:
             #     logger.info(
@@ -605,13 +646,37 @@ class PipelineModule(nn.Module):
         self._synchronize_tied_weights()
 
     def _is_checkpointable(self, funcs):
-        # This is an unfortunate hack related to torch and deepspeed activation checkpoint implementations.
-        # Some layers like torch.nn.Embedding will not receive grads if checkpointed, which breaks things.
-        # I presume it's related to the discrete inputs that cannot require_grad? Need to revisit.
-        if self.__class__.__name__ in ('GPTModelPipe', 'GPT2ModelPipe'):
-            return all('ParallelTransformerLayerPipe' in f.__class__.__name__ for f in funcs)
+
+        if self.activation_checkpoint_func is not checkpointing.non_reentrant_checkpoint:
+            # This hook excludes the embedding layer
+            # because only non_reentrant_checkpoint can accept inputs with requires_grad=False
+            # otherwise, the backward of the embedding layer won't receive gradients.
+            if self.__class__.__name__ in ('GPTModelPipe', 'GPT2ModelPipe'):
+                # For GPT models, checkpoint both transformer layers and any additional
+                # layers specified in checkpointable_layers (if provided)
+                return all('ParallelTransformerLayerPipe' in f.__class__.__name__ or (
+                    self.checkpointable_layers is not None and f.__class__.__name__ in self.checkpointable_layers)
+                           for f in funcs)
+
         if self.checkpointable_layers is not None:
+            # For non-GPT models, only checkpoint layers specified in checkpointable_layers
             return all(f.__class__.__name__ in self.checkpointable_layers for f in funcs)
 
+        # Default behavior: checkpoint any layer that has parameters
         params = [f.parameters() for f in funcs if isinstance(f, torch.nn.Module)]
         return any(len(list(p)) > 0 for p in params)
+
+    def get_additional_losses(self):
+        """ Returns model specific additional losses for reporting
+
+         Return a dictionary of {"loss name": loss_value} or None if no additional losses.
+        """
+        return None
+
+    def compile(self, *args, **kwargs):
+        for idx, layer in enumerate(self.forward_funcs):
+            if isinstance(layer, nn.Module):
+                layer.compile(*args, **kwargs)
+            else:
+                new_layer = torch.compile(layer, *args, **kwargs)
+                self.forward_funcs[idx] = new_layer

@@ -9,14 +9,25 @@ This file is adapted from FP16_Optimizer in NVIDIA/apex
 
 import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
-
-from deepspeed.runtime import DeepSpeedOptimizer
-from deepspeed.runtime.utils import get_global_norm, get_grad_norm, CheckOverflow, get_weight_norm
+from deepspeed.runtime.base_optimizer import DeepSpeedOptimizer
+from deepspeed.runtime.utils import get_global_norm, get_flattened_grad_norm, CheckOverflow, get_weight_norm, get_norm_with_moe_layers, is_model_parallel_parameter
 from deepspeed.runtime.fp16.loss_scaler import INITIAL_LOSS_SCALE, SCALE_WINDOW, MIN_LOSS_SCALE
-from deepspeed.utils import groups, logger, log_dist
-from deepspeed import comm as dist
+from deepspeed.utils import logger, log_dist
+from deepspeed.utils.torch import required_torch_version
 from deepspeed.checkpoint.constants import OPTIMIZER_STATE_DICT, CLIP_GRAD
 from deepspeed.accelerator import get_accelerator
+from deepspeed.moe.utils import is_moe_param_group
+from deepspeed.runtime.constants import PIPE_REPLICATED
+from deepspeed.utils.bwc import bwc_tensor_model_parallel_rank
+
+OVERFLOW_CHECK_TIMER = 'overflow_check'
+COMPUTE_NORM_TIMER = 'compute_norm'
+UNSCALE_AND_CLIP_TIMER = 'unscale_and_clip'
+BASIC_STEP_TIMER = 'basic_step'
+UPDATE_FP16_TIMER = 'update_fp16'
+
+OVERFLOW_TIMERS = [COMPUTE_NORM_TIMER, OVERFLOW_CHECK_TIMER]
+STEP_TIMERS = OVERFLOW_TIMERS + [UNSCALE_AND_CLIP_TIMER, BASIC_STEP_TIMER, UPDATE_FP16_TIMER]
 
 
 class FP16_Optimizer(DeepSpeedOptimizer):
@@ -54,6 +65,8 @@ class FP16_Optimizer(DeepSpeedOptimizer):
         self.fp16_groups_flat = []
         self.fp32_groups_flat = []
 
+        self.flatten_grad_norm_mask_list = []
+        self.has_executed_step = False
         self._global_grad_norm = 0.
 
         # loop to deal with groups
@@ -98,11 +111,8 @@ class FP16_Optimizer(DeepSpeedOptimizer):
 
         self.clip_grad = clip_grad
         self.norm_type = 2
-        self.step_count = 0
 
-        TORCH_MAJOR = int(torch.__version__.split('.')[0])
-        TORCH_MINOR = int(torch.__version__.split('.')[1])
-        if TORCH_MAJOR == 0 and TORCH_MINOR <= 4:
+        if required_torch_version(max_version=0.4):
             self.clip_grad_norm = torch.nn.utils.clip_grad_norm
         else:
             self.clip_grad_norm = torch.nn.utils.clip_grad_norm_
@@ -126,7 +136,7 @@ class FP16_Optimizer(DeepSpeedOptimizer):
 
         return
 
-    def zero_grad(self, set_to_none=False):
+    def zero_grad(self, set_to_none=True):
         """
         Zero FP16 parameter grads.
         """
@@ -184,20 +194,6 @@ class FP16_Optimizer(DeepSpeedOptimizer):
                 p.data = q.data
         return self.overflow
 
-    def start_timers(self, name_list):
-        if self.timers is not None:
-            for name in name_list:
-                self.timers(name).start()
-
-    def stop_timers(self, name_list):
-        if self.timers is not None:
-            for name in name_list:
-                self.timers(name).stop()
-
-    def log_timers(self, name_list):
-        if self.timers is not None:
-            self.timers.log(name_list)
-
     def set_lr(self, lr):
         """Set the learning rate."""
         for param_group in self.optimizer.param_groups:
@@ -213,6 +209,40 @@ class FP16_Optimizer(DeepSpeedOptimizer):
         self.custom_loss_scaler = True
         self.external_loss_scale = loss_scale
 
+    def _require_avoid_recompute_norm(self, p, tensor_model_parallel_rank):
+        # for filtering  replicated tensors from tensor
+        if hasattr(p, PIPE_REPLICATED) and p.ds_pipe_replicated:
+            return True
+        if (tensor_model_parallel_rank > 0) and not is_model_parallel_parameter(p):
+            return True
+
+    def _get_norm_mask_idx(self, group):
+        """The function preserves the parallel information for norm
+        from unflattened gradients.
+
+        Args:
+            group (Iterable[Tensor] ): params group
+
+        Returns:
+            torch.Tensor: A 2D tensor containing index ranges for each group,
+                      where each row represents a [start index, end index].
+        """
+        group_mask_idx_list = []
+        grad_flat_st_idx = 0
+        grad_flat_en_idx = 0
+
+        for p in group:
+            grad_flat_en_idx = grad_flat_st_idx + p.numel()
+            if p.grad is not None and self._require_avoid_recompute_norm(p, bwc_tensor_model_parallel_rank(self.mpu)):
+                # merge range
+                if len(group_mask_idx_list) > 0 and grad_flat_st_idx == group_mask_idx_list[-1][-1]:
+                    group_mask_idx_list[-1][-1] = grad_flat_en_idx
+                else:
+                    group_mask_idx_list.append([grad_flat_st_idx, grad_flat_en_idx])
+            grad_flat_st_idx = grad_flat_en_idx
+
+        return torch.tensor(group_mask_idx_list, device=get_accelerator().current_device_name())
+
     def step(self, closure=None):
         """
         Not supporting closure.
@@ -221,21 +251,13 @@ class FP16_Optimizer(DeepSpeedOptimizer):
         if self.fused_adam_legacy:
             return self.step_fused_adam()
 
-        COMPUTE_NORM = "compute_norm"
-        OVERFLOW_CHECK = 'overflow_check'
-        OVERFLOW_TIMERS = [COMPUTE_NORM, OVERFLOW_CHECK]
-        UNSCALE_AND_CLIP = 'unscale_and_clip'
-        BASIC_STEP = 'basic_step'
-        UPDATE_FP16 = 'update_fp16'
-        STEP_TIMERS = OVERFLOW_TIMERS + [UNSCALE_AND_CLIP, BASIC_STEP, UPDATE_FP16]
-
         # First determine if there is overflow.
-        self.start_timers([OVERFLOW_CHECK])
+        self.timers(OVERFLOW_CHECK_TIMER).start()
         fp16_params = []
         for i, group in enumerate(self.fp16_groups):
             fp16_params.extend([p for p in group if p.grad is not None])
         self.overflow = self.overflow_checker.has_overflow(fp16_params)
-        self.stop_timers([OVERFLOW_CHECK])
+        self.timers(OVERFLOW_CHECK_TIMER).stop()
         prev_scale = self.cur_scale
         self._update_scale(self.overflow)
         if self.overflow:
@@ -249,10 +271,14 @@ class FP16_Optimizer(DeepSpeedOptimizer):
                 for p in group:
                     p.grad = None
 
-            self.log_timers(OVERFLOW_TIMERS)
+            self.timers.log(OVERFLOW_TIMERS)
             return self.overflow
 
         grads_groups_flat = []
+        non_experts_grads_for_norm = []
+        expert_grads_for_norm = {}
+        assert len(self.fp16_groups) == len(self.optimizer.param_groups)
+
         for i, group in enumerate(self.fp16_groups):
             data_type = self.fp32_groups_flat[i].dtype
 
@@ -262,65 +288,69 @@ class FP16_Optimizer(DeepSpeedOptimizer):
                     for p in group
                 ]))
 
+            self.fp32_groups_flat[i].grad = grads_groups_flat[i]
+            param_group = self.optimizer.param_groups[i]
+
+            # split expert and non_expert grads for norm
+            if self.has_moe_layers and is_moe_param_group(param_group):
+                if param_group['name'] not in expert_grads_for_norm:
+                    expert_grads_for_norm[param_group['name']] = []
+
+                expert_grads_for_norm[param_group['name']].append(self.fp32_groups_flat[i])
+            else:
+                # retrieves the required mask for calculating the norm of flat_grad
+                # perform this collect operation only once
+                if not self.has_executed_step:
+                    cur_flat_grad_norm_mask = self._get_norm_mask_idx(group)
+                    self.flatten_grad_norm_mask_list.append(cur_flat_grad_norm_mask)
+
+                non_experts_grads_for_norm.append(self.fp32_groups_flat[i])
+
             for p in group:
                 p.grad = None
 
-            self.fp32_groups_flat[i].grad = grads_groups_flat[i]
+        self.timers(COMPUTE_NORM_TIMER).start()
 
-        self.start_timers([COMPUTE_NORM])
-
-        all_groups_norm = get_grad_norm(self.fp32_groups_flat, mpu=self.mpu)
-
-        self.stop_timers([COMPUTE_NORM])
+        all_groups_norm = get_flattened_grad_norm(non_experts_grads_for_norm,
+                                                  mpu=self.mpu,
+                                                  grad_norm_mask=self.flatten_grad_norm_mask_list)
 
         if self.has_moe_layers:
-            all_groups_norm = self._get_norm_with_moe_layers(all_groups_norm)
+            all_groups_norm = get_norm_with_moe_layers(all_groups_norm,
+                                                       mpu=self.mpu,
+                                                       expert_tensors=expert_grads_for_norm,
+                                                       norm_type=self.norm_type)
 
         scaled_global_grad_norm = get_global_norm(norm_list=[all_groups_norm])
+        self.timers(COMPUTE_NORM_TIMER).stop()
 
         # Stash unscaled gradient norm
         self._global_grad_norm = scaled_global_grad_norm / self.cur_scale
 
-        self.start_timers([UNSCALE_AND_CLIP])
+        self.timers(UNSCALE_AND_CLIP_TIMER).start()
         self.unscale_and_clip_grads(grads_groups_flat, scaled_global_grad_norm)
-        self.stop_timers([UNSCALE_AND_CLIP])
+        self.timers(UNSCALE_AND_CLIP_TIMER).stop()
 
-        self.start_timers([BASIC_STEP])
+        self.timers(BASIC_STEP_TIMER).start()
         self.optimizer.step()
-        self.stop_timers([BASIC_STEP])
+        self.timers(BASIC_STEP_TIMER).stop()
 
         #get rid of the fp32 gradients. Not needed anymore
         for group in self.fp32_groups_flat:
             group.grad = None
 
-        self.start_timers([UPDATE_FP16])
+        self.timers(UPDATE_FP16_TIMER).start()
 
         for i in range(len(self.fp16_groups)):
             updated_params = _unflatten_dense_tensors(self.fp32_groups_flat[i], self.fp16_groups[i])
             for p, q in zip(self.fp16_groups[i], updated_params):
                 p.data.copy_(q.data)
+        self.has_executed_step = True
+        self.timers(UPDATE_FP16_TIMER).stop()
 
-        self.stop_timers([UPDATE_FP16])
-
-        self.log_timers(STEP_TIMERS)
-
-        self.step_count += 1
+        self.timers.log(STEP_TIMERS)
 
         return self.overflow
-
-    def _get_norm_with_moe_layers(self, all_groups_norm):
-        #all_groups_norm_old = all_groups_norm
-        # Need to allreduce (avg) the norms across different ranks because moe params will not be synced during allreduce
-        if self.using_pipeline:
-            pg = self.deepspeed.mpu.get_data_parallel_group()
-        else:
-            pg = groups._get_data_parallel_group()
-        scaled_norm = all_groups_norm * 1.0 / float(dist.get_world_size(group=pg))
-        scaled_norm_tensor = torch.tensor(scaled_norm, device=self.fp32_groups_flat[0].device, dtype=torch.float)
-        dist.all_reduce(scaled_norm_tensor, group=pg)
-        all_groups_norm = scaled_norm_tensor.item()
-        #print(f"old = {all_groups_norm_old} and new = {all_groups_norm} at rank: {deepspeed.comm.get_rank()}")
-        return all_groups_norm
 
     def unscale_and_clip_grads(self, grad_groups_flat, total_norm, apply_scale=True):
         # compute combined scale factor for this group
